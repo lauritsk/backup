@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/lauritsk/backup/internal/buildinfo"
+	"github.com/lauritsk/backup/internal/logging"
 	"github.com/lauritsk/backup/internal/pimbackup/config"
 	"github.com/lauritsk/backup/internal/pimbackup/model"
 )
@@ -98,7 +99,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		fmt.Fprintln(stderr, "pimbackup: invalid configuration:", err)
 		return 2
 	}
-	logger, err := newLogger(cfg.Log, stderr)
+	logger, err := logging.New(cfg.Log.Level, cfg.Log.Format, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "pimbackup:", err)
 		return 2

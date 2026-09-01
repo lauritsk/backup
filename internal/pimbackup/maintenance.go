@@ -90,7 +90,7 @@ func (s *Service) checkStorage() error {
 }
 
 func (s *Service) Rebuild(ctx context.Context) (model.RebuildReport, error) {
-	release, err := s.gate.tryAcquire()
+	release, err := s.gate.TryAcquire()
 	if err != nil {
 		return model.RebuildReport{}, err
 	}
