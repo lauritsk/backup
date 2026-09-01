@@ -1,6 +1,6 @@
 # Backup suite specification
 
-Status: PIM Backup implements IMAP and JMAP Mail, CardDAV contacts, and CalDAV calendars. Cloud Backup and Application Backup remain command scaffolds.
+Status: PIM Backup implements IMAP and JMAP Mail, CardDAV contacts, and CalDAV calendars. Cloud Backup implements rclone acquisition, local browse, verification, restore export, diagnostics, scheduling, and its HTTP API. Application Backup remains a command scaffold.
 
 This file is the product and implementation specification for the suite.
 
@@ -35,7 +35,10 @@ The checked-in code follows this shape:
 │   ├── appbackup/          # Application Backup command scaffold
 │   ├── atomicfile/         # durable temporary write, fsync, and rename
 │   ├── buildinfo/          # shared build metadata
-│   ├── cloudbackup/        # Cloud Backup command scaffold
+│   ├── cloudbackup/        # Cloud Backup service and rclone process boundary
+│   ├── configutil/         # strict JSON, duration, and environment parsing
+│   ├── logging/            # shared slog construction
+│   ├── operationlock/      # process-local and filesystem operation lock
 │   ├── pimbackup/
 │   │   ├── catalog/        # PIM SQLite schema and queries
 │   │   ├── config/         # PIM JSON, environment, CLI, and secrets
@@ -72,16 +75,16 @@ The first PIM implementation may keep code local until a second tool needs it. E
 | Build metadata | Version, revision, build time, Go version, CLI and API representation | Image labels and tool name | `internal/buildinfo` exists |
 | Secrets | Reject direct plus `_FILE`, read the file, remove one final line ending, never log values | Which fields are secret and how credentials are used | `internal/secret` exists |
 | Run vocabulary | `backup`, `verify`, and `restore` operations; queued, running, terminal, and interrupted states | Run detail, resource identifiers, progress, and catalog persistence | `internal/run` exists |
-| Configuration loading | Apply defaults, JSON, environment, then CLI; report source errors; redact output | Config structs, defaults, environment prefix, semantic validation | Implemented for PIM, kept under `internal/pimbackup/config` until a second use |
-| Logging | Construct `slog`, choose level and format, attach run and request IDs | Domain event names and safe fields | Implemented inside PIM, not extracted yet |
-| Process lifecycle | Signal cancellation, bounded shutdown, and startup cleanup | Closing protocol sessions and external processes | Implemented inside PIM, not extracted yet |
-| HTTP mechanics | Timeouts, body limits, JSON errors, common health/version/run routes | Resource, browse, backup, verification, and restore request bodies | Implemented inside PIM, not extracted yet |
-| Health and diagnostics | Aggregate named checks and stable statuses | IMAP login, rclone remote, Restic repository, database, and engine checks | Implemented for PIM only |
-| Scheduling | Fixed intervals, cancellation, no overlapping scheduled run | Which configured accounts, sources, or applications a tick selects | Implemented for PIM only |
-| Operation locking | Process-local exclusion and a lock beneath `/data` for cron versus server races | Whether a domain read can coexist with an operation | Implemented for PIM only |
-| Durable files | Same-filesystem temporary files, file sync, atomic rename, and parent directory sync | Canonical names, payload validation, and reconciliation | `internal/atomicfile` and PIM mail storage exist |
-| Verification flow | Start and finish a run, cancellation, report envelope, safe error recording | Every integrity check and test restore | Implemented for PIM only |
-| SQLite mechanics | Connection settings and transaction helpers only if more than one tool needs identical behavior | Schema, queries, cursors, and reconciliation | The initial PIM schema stays under `internal/pimbackup/catalog` |
+| Configuration loading | Strict bounded JSON, duplicate detection, duration parsing, and environment booleans | Config structs, defaults, environment prefix, semantic validation, and redaction | Shared mechanics are in `internal/configutil`; schemas remain tool-owned |
+| Logging | Construct `slog` and choose level and format | Domain event names and safe fields | Shared construction is in `internal/logging` |
+| Process lifecycle | Signal cancellation, bounded shutdown, and startup cleanup | Closing protocol sessions and external processes | Implemented separately for PIM and Cloud |
+| HTTP mechanics | Timeouts, body limits, JSON errors, common health/version/run routes | Resource, browse, backup, verification, and restore request bodies | Implemented separately for PIM and Cloud |
+| Health and diagnostics | Aggregate named checks and stable statuses | IMAP login, rclone remote, Restic repository, database, and engine checks | Implemented for PIM and Cloud |
+| Scheduling | Fixed intervals, cancellation, no overlapping scheduled run | Which configured accounts, sources, or applications a tick selects | Implemented separately for PIM and Cloud |
+| Operation locking | Process-local exclusion and a lock beneath `/data` for cron versus server races | Lock filename, conflict wording, and whether a domain read can coexist with an operation | Shared gate is in `internal/operationlock` |
+| Durable files | Same-filesystem temporary files, file sync, atomic rename, and parent directory sync | Canonical names, payload validation, and reconciliation | Shared atomic writes are used by PIM and Cloud; payload rules remain tool-owned |
+| Verification flow | Start and finish a run, cancellation, report envelope, safe error recording | Every integrity check and test restore | Implemented separately for PIM and Cloud |
+| SQLite mechanics | Connection settings and transaction helpers only if more than one tool needs identical behavior | Schema, queries, cursors, and reconciliation | PIM and Cloud keep separate catalogs and schemas |
 
 The following must not become shared suite abstractions:
 
@@ -259,7 +262,7 @@ Cloud Backup is an rclone acquisition service, not a second rclone configuration
 
 ### Cloud-owned logic
 
-- Source configuration and mapping to an existing or generated rclone configuration.
+- Source configuration and mapping to an existing rclone configuration.
 - Safe construction of rclone arguments and environment variables.
 - Source capability discovery, filters, include and exclude rules, and bandwidth policy.
 - Mapping remote paths to local source roots.
@@ -371,7 +374,7 @@ Every restore path needs an automated round trip before its backup path is calle
 1. Keep the three binaries buildable and independent.
 2. Add configuration, logging, lifecycle, locking, run persistence, and durable-file code only as the IMAP slice needs them.
 3. Keep IMAP, JMAP Mail, CardDAV, and CalDAV backup, browse, verify, restore, reconciliation, and `db rebuild` covered by round-trip tests.
-4. Build Cloud Backup around a pinned rclone process boundary.
+4. Keep Cloud Backup's rclone process boundary read-only on the remote side.
 5. Build Application Backup around Restic and native database clients.
 6. Extract more shared code only after the second real use proves identical behavior.
 

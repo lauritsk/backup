@@ -1,4 +1,5 @@
-package pimbackup
+// Package operationlock excludes operations across goroutines and processes.
+package operationlock
 
 import (
 	"errors"
@@ -10,16 +11,20 @@ import (
 	"github.com/gofrs/flock"
 )
 
-var ErrOperationBusy = errors.New("another backup, verification, restore, or rebuild is already running")
-
-type operationGate struct {
-	mutex  sync.Mutex
-	active bool
-	file   *flock.Flock
+// Gate combines a process-local guard with an advisory filesystem lock.
+type Gate struct {
+	mutex   sync.Mutex
+	active  bool
+	file    *flock.Flock
+	busyErr error
 }
 
-func newOperationGate(dataDir string) (*operationGate, error) {
-	lockPath := filepath.Join(dataDir, ".pimbackup.lock")
+// New creates a gate using a regular lock file beneath dataDir.
+func New(dataDir, filename string, busyErr error) (*Gate, error) {
+	if busyErr == nil {
+		return nil, errors.New("operation lock requires a busy error")
+	}
+	lockPath := filepath.Join(dataDir, filename)
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	switch {
 	case err == nil:
@@ -40,26 +45,27 @@ func newOperationGate(dataDir string) (*operationGate, error) {
 	if err := os.Chmod(lockPath, 0o600); err != nil {
 		return nil, fmt.Errorf("set operation lock permissions: %w", err)
 	}
-	return &operationGate{file: flock.New(lockPath)}, nil
+	return &Gate{file: flock.New(lockPath), busyErr: busyErr}, nil
 }
 
-func (g *operationGate) tryAcquire() (func() error, error) {
+// TryAcquire returns immediately when this or another process owns the lock.
+func (g *Gate) TryAcquire() (func() error, error) {
 	g.mutex.Lock()
 	if g.active {
 		g.mutex.Unlock()
-		return nil, ErrOperationBusy
+		return nil, g.busyErr
 	}
 	g.active = true
 	g.mutex.Unlock()
 
 	locked, err := g.file.TryLock()
 	if err != nil {
-		g.clearActive()
+		g.clear()
 		return nil, fmt.Errorf("acquire operation lock: %w", err)
 	}
 	if !locked {
-		g.clearActive()
-		return nil, ErrOperationBusy
+		g.clear()
+		return nil, g.busyErr
 	}
 
 	var once sync.Once
@@ -67,13 +73,15 @@ func (g *operationGate) tryAcquire() (func() error, error) {
 		var unlockErr error
 		once.Do(func() {
 			unlockErr = g.file.Unlock()
-			g.clearActive()
+			g.clear()
 		})
 		return unlockErr
 	}, nil
 }
 
-func (g *operationGate) clearActive() {
+func (g *Gate) Close() error { return g.file.Close() }
+
+func (g *Gate) clear() {
 	g.mutex.Lock()
 	g.active = false
 	g.mutex.Unlock()

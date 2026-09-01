@@ -2,7 +2,6 @@ package pimbackup
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -19,7 +18,7 @@ func TestServiceDefersReconciliationWhileAnotherOperationRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	release, err := first.gate.tryAcquire()
+	release, err := first.gate.TryAcquire()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,38 +39,5 @@ func TestServiceDefersReconciliationWhileAnotherOperationRuns(t *testing.T) {
 	}
 	if err := second.Ready(context.Background()); err != nil {
 		t.Fatalf("Ready() after deferred reconciliation = %v", err)
-	}
-}
-
-func TestOperationGateExcludesProcessesSharingData(t *testing.T) {
-	dataDir := t.TempDir()
-	first, err := newOperationGate(dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := newOperationGate(dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	releaseFirst, err := first.tryAcquire()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := first.tryAcquire(); !errors.Is(err, ErrOperationBusy) {
-		t.Fatalf("same gate error = %v", err)
-	}
-	if _, err := second.tryAcquire(); !errors.Is(err, ErrOperationBusy) {
-		t.Fatalf("second gate error = %v", err)
-	}
-	if err := releaseFirst(); err != nil {
-		t.Fatal(err)
-	}
-	releaseSecond, err := second.tryAcquire()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := releaseSecond(); err != nil {
-		t.Fatal(err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lauritsk/backup/internal/operationlock"
 	"github.com/lauritsk/backup/internal/pimbackup/catalog"
 	"github.com/lauritsk/backup/internal/pimbackup/config"
 	imapbackup "github.com/lauritsk/backup/internal/pimbackup/imap"
@@ -21,13 +22,15 @@ import (
 	runmodel "github.com/lauritsk/backup/internal/run"
 )
 
+var ErrOperationBusy = errors.New("another backup, verification, restore, or rebuild is already running")
+
 type Service struct {
 	config          config.Config
 	catalog         *catalog.Catalog
 	store           *mailstore.Store
 	objectStore     *objectstore.Store
 	dialer          imapbackup.Dialer
-	gate            *operationGate
+	gate            *operationlock.Gate
 	logger          *slog.Logger
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -62,7 +65,7 @@ func OpenService(ctx context.Context, cfg config.Config, options ServiceOptions)
 		catalogStore.Close()
 		return nil, err
 	}
-	gate, err := newOperationGate(cfg.DataDir)
+	gate, err := operationlock.New(cfg.DataDir, ".pimbackup.lock", ErrOperationBusy)
 	if err != nil {
 		catalogStore.Close()
 		return nil, err
@@ -72,7 +75,7 @@ func OpenService(ctx context.Context, cfg config.Config, options ServiceOptions)
 		config: cfg, catalog: catalogStore, store: fileStore, objectStore: objectStore,
 		dialer: options.Dialer, gate: gate, logger: options.Logger, ctx: serviceContext, cancel: cancel,
 	}
-	release, lockErr := service.gate.tryAcquire()
+	release, lockErr := service.gate.TryAcquire()
 	if errors.Is(lockErr, ErrOperationBusy) {
 		service.logger.Warn("startup reconciliation skipped because another process holds the operation lock")
 		return service, nil
@@ -127,7 +130,7 @@ func (s *Service) initialize(ctx context.Context) error {
 func (s *Service) Close() error {
 	s.cancel()
 	s.async.Wait()
-	return errors.Join(s.gate.file.Close(), s.catalog.Close())
+	return errors.Join(s.gate.Close(), s.catalog.Close())
 }
 
 func (s *Service) Config() config.Config { return s.config }
@@ -205,7 +208,7 @@ type preparedOperation struct {
 }
 
 func (s *Service) prepareOperation(ctx context.Context, operation runmodel.Operation, request any, action operationAction) (*preparedOperation, error) {
-	release, err := s.gate.tryAcquire()
+	release, err := s.gate.TryAcquire()
 	if err != nil {
 		return nil, err
 	}

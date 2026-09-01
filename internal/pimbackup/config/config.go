@@ -2,11 +2,8 @@
 package config
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"os"
@@ -17,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/lauritsk/backup/internal/configutil"
 	"github.com/lauritsk/backup/internal/secret"
 )
 
@@ -27,23 +25,7 @@ const (
 
 var accountIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 
-// Duration is a JSON duration encoded as a string such as "30s" or "24h".
-type Duration struct {
-	time.Duration
-}
-
-func (d *Duration) UnmarshalText(text []byte) error {
-	parsed, err := time.ParseDuration(string(text))
-	if err != nil {
-		return err
-	}
-	d.Duration = parsed
-	return nil
-}
-
-func (d Duration) MarshalText() ([]byte, error) {
-	return []byte(d.Duration.String()), nil
-}
+type Duration = configutil.Duration
 
 // Config is the effective PIM Backup configuration.
 type Config struct {
@@ -165,105 +147,7 @@ func selectConfigPath(cliPath *string) (string, bool) {
 }
 
 func decodeFile(filename string, explicit bool, cfg *Config) error {
-	if filename == "" {
-		return errors.New("config path cannot be empty")
-	}
-	file, err := os.Open(filename)
-	if err != nil {
-		if !explicit && errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("load config %q: %w", filename, err)
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, (4<<20)+1))
-	if err != nil {
-		return fmt.Errorf("load config %q: %w", filename, err)
-	}
-	if len(data) > 4<<20 {
-		return fmt.Errorf("load config %q: file exceeds 4 MiB", filename)
-	}
-	if err := rejectDuplicateJSONNames(data); err != nil {
-		return fmt.Errorf("load config %q: %w", filename, err)
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(cfg); err != nil {
-		return fmt.Errorf("load config %q: %w", filename, err)
-	}
-	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = errors.New("configuration must contain one JSON value")
-		}
-		return fmt.Errorf("load config %q: %w", filename, err)
-	}
-	return nil
-}
-
-func rejectDuplicateJSONNames(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	var parseValue func(json.Token) error
-	parseValue = func(token json.Token) error {
-		delimiter, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			seen := make(map[string]struct{})
-			for decoder.More() {
-				nameToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				name, ok := nameToken.(string)
-				if !ok {
-					return errors.New("JSON object name is not a string")
-				}
-				if _, duplicate := seen[name]; duplicate {
-					return fmt.Errorf("duplicate JSON field %q", name)
-				}
-				seen[name] = struct{}{}
-				value, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				if err := parseValue(value); err != nil {
-					return err
-				}
-			}
-			_, err := decoder.Token()
-			return err
-		case '[':
-			for decoder.More() {
-				value, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				if err := parseValue(value); err != nil {
-					return err
-				}
-			}
-			_, err := decoder.Token()
-			return err
-		default:
-			return errors.New("unexpected JSON delimiter")
-		}
-	}
-	first, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	if err := parseValue(first); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("configuration must contain one JSON value")
-		}
-		return err
-	}
-	return nil
+	return configutil.DecodeFile(filename, !explicit, 4<<20, cfg)
 }
 
 func normalizeAccounts(cfg *Config) {
@@ -329,16 +213,7 @@ func applyEnvironment(cfg *Config) error {
 }
 
 func envBool(name string, target *bool) error {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return nil
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	*target = parsed
-	return nil
+	return configutil.EnvBool(name, target)
 }
 
 func applyOverrides(cfg *Config, overrides Overrides) {
