@@ -1,0 +1,51 @@
+[tools]
+go = "latest"
+sqlite = "latest"
+
+[tasks.build]
+description = "Build all binaries"
+run = "mkdir -p bin && go build -o bin/ ./cmd/..."
+
+[tasks.fmt]
+description = "Format Go source"
+run = "find cmd internal -name '*.go' -exec gofmt -w {} +"
+
+[tasks."fmt:check"]
+description = "Check Go source formatting"
+run = '''
+unformatted="$(find cmd internal -name '*.go' -exec gofmt -l {} +)"
+if [ -n "$unformatted" ]; then
+  echo "Files need gofmt:"
+  echo "$unformatted"
+  exit 1
+fi
+'''
+
+[tasks.deps]
+description = "Tidy Go dependencies"
+run = "go mod tidy"
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks."test:race"]
+description = "Run tests with the race detector"
+run = "go test -race ./..."
+
+[tasks."run:pimbackup"]
+description = "Run pimbackup from source"
+raw = true
+run = "go run ./cmd/pimbackup"
+
+[tasks.vet]
+description = "Run go vet"
+run = "go vet ./..."
+
+[tasks.check]
+description = "Run local checks and build"
+depends = ["fmt:check", "test", "vet", "build"]
+
+[tasks.clean]
+description = "Remove generated files"
+run = "rm -rf bin"
