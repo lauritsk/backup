@@ -1,0 +1,64 @@
+{
+  "data_dir": "/data",
+  "server": {
+    "listen": "0.0.0.0:8080",
+    "read_header_timeout": "5s",
+    "read_timeout": "30s",
+    "idle_timeout": "60s",
+    "shutdown_timeout": "15s",
+    "auth_token_file": "/run/secrets/pimbackup_api_token"
+  },
+  "schedule": {
+    "enabled": true,
+    "interval": "24h",
+    "run_on_start": false
+  },
+  "log": {
+    "level": "info",
+    "format": "json"
+  },
+  "accounts": [
+    {
+      "id": "personal",
+      "protocol": "imap",
+      "host": "imap.example.com",
+      "port": 993,
+      "tls": "implicit",
+      "username": "person@example.com",
+      "password_file": "/run/secrets/personal_imap_password",
+      "mailboxes": ["*"],
+      "exclude_mailboxes": ["Spam"],
+      "timeout": "30s"
+    },
+    {
+      "id": "jmap-mail",
+      "protocol": "jmap",
+      "host": "mail.example.com",
+      "auth": "bearer",
+      "token_file": "/run/secrets/jmap_token",
+      "collections": ["*"],
+      "timeout": "30s",
+      "disabled": true
+    },
+    {
+      "id": "contacts",
+      "protocol": "carddav",
+      "username": "person@example.com",
+      "auth": "basic",
+      "password_file": "/run/secrets/dav_password",
+      "collections": ["*"],
+      "timeout": "30s",
+      "disabled": true
+    },
+    {
+      "id": "calendars",
+      "protocol": "caldav",
+      "username": "person@example.com",
+      "auth": "basic",
+      "password_file": "/run/secrets/dav_password",
+      "collections": ["*"],
+      "timeout": "30s",
+      "disabled": true
+    }
+  ]
+}

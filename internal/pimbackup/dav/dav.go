@@ -1,0 +1,322 @@
+// Package dav adapts emersion's WebDAV clients for CardDAV and CalDAV backup.
+package dav
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+
+	"github.com/emersion/go-webdav"
+	"github.com/emersion/go-webdav/caldav"
+	"github.com/emersion/go-webdav/carddav"
+	"github.com/google/uuid"
+
+	"github.com/lauritsk/backup/internal/pimbackup/config"
+)
+
+var (
+	discoverCardDAV = carddav.DiscoverContextURL
+	discoverCalDAV  = caldav.DiscoverContextURL
+)
+
+type Collection struct{ Name, RemoteID, URL, SyncToken, Kind string }
+type Object struct{ RemoteID, URL, ETag, ContentType string }
+
+type Client struct {
+	account  config.AccountConfig
+	endpoint *url.URL
+	http     *http.Client
+	webdav   *webdav.Client
+	carddav  *carddav.Client
+	caldav   *caldav.Client
+}
+
+// New discovers an endpoint when account.URL is empty. An explicit URL is an
+// override and may point at a service root, collection home, or collection.
+func New(ctx context.Context, account config.AccountConfig) (*Client, error) {
+	endpoint, err := discoverEndpoint(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("parse DAV endpoint: %w", err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: account.InsecureSkipVerify}
+	httpClient := &http.Client{Timeout: account.Timeout.Duration, Transport: transport}
+	httpClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if len(via) > 0 && via[0].Method == http.MethodPut {
+			return errors.New("refusing DAV PUT redirect")
+		}
+		if len(via) > 10 {
+			return errors.New("too many DAV redirects")
+		}
+		if parsed.Scheme == "https" && request.URL.Scheme != "https" {
+			return errors.New("refusing DAV HTTPS downgrade")
+		}
+		setAuth(request, account)
+		return nil
+	}
+	authenticated := authenticatedClient{client: httpClient, account: account}
+	wc, err := webdav.NewClient(authenticated, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client := &Client{account: account, endpoint: parsed, http: httpClient, webdav: wc}
+	switch account.Protocol {
+	case "carddav":
+		client.carddav, err = carddav.NewClient(authenticated, endpoint)
+	case "caldav":
+		client.caldav, err = caldav.NewClient(authenticated, endpoint)
+	default:
+		err = fmt.Errorf("unsupported DAV protocol %q", account.Protocol)
+	}
+	if err != nil {
+		httpClient.CloseIdleConnections()
+		return nil, err
+	}
+	return client, nil
+}
+
+func discoverEndpoint(ctx context.Context, account config.AccountConfig) (string, error) {
+	if account.URL != "" {
+		return account.URL, nil
+	}
+	domain := account.Host
+	if domain == "" {
+		if index := strings.LastIndex(account.Username, "@"); index >= 0 {
+			domain = account.Username[index+1:]
+		}
+	}
+	if domain == "" {
+		return "", errors.New("DAV autodiscovery requires host or an email-style username")
+	}
+	var endpoint string
+	var err error
+	if account.Protocol == "carddav" {
+		endpoint, err = discoverCardDAV(ctx, domain)
+	} else {
+		endpoint, err = discoverCalDAV(ctx, domain)
+	}
+	if err == nil {
+		return endpoint, nil
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsTemporary {
+		return "", fmt.Errorf("temporary DAV discovery failure: %w", err)
+	}
+	return "https://" + domain + "/.well-known/" + account.Protocol, nil
+}
+
+func (c *Client) Close() { c.http.CloseIdleConnections() }
+
+func (c *Client) Collections(ctx context.Context) ([]Collection, error) {
+	var result []Collection
+	var discoveryErr error
+	if c.account.URL != "" {
+		switch c.account.Protocol {
+		case "carddav":
+			books, err := c.carddav.FindAddressBooks(ctx, c.endpoint.Path)
+			discoveryErr = err
+			if err == nil {
+				for _, book := range books {
+					result = append(result, Collection{Name: collectionName(book.Name, book.Path, "Contacts"), RemoteID: book.Path, URL: c.resolve(book.Path), Kind: "contact"})
+				}
+			}
+		case "caldav":
+			calendars, err := c.caldav.FindCalendars(ctx, c.endpoint.Path)
+			discoveryErr = err
+			if err == nil {
+				for _, calendar := range calendars {
+					result = append(result, Collection{Name: collectionName(calendar.Name, calendar.Path, "Calendar"), RemoteID: calendar.Path, URL: c.resolve(calendar.Path), Kind: "calendar"})
+				}
+			}
+		}
+		if len(result) > 0 {
+			return result, nil
+		}
+	}
+	switch c.account.Protocol {
+	case "carddav":
+		principal, err := c.carddav.FindCurrentUserPrincipal(ctx)
+		if err == nil {
+			var home string
+			home, err = c.carddav.FindAddressBookHomeSet(ctx, principal)
+			if err == nil {
+				var books []carddav.AddressBook
+				books, err = c.carddav.FindAddressBooks(ctx, home)
+				if err == nil {
+					for _, book := range books {
+						result = append(result, Collection{Name: collectionName(book.Name, book.Path, "Contacts"), RemoteID: book.Path, URL: c.resolve(book.Path), Kind: "contact"})
+					}
+				}
+			}
+		}
+		discoveryErr = err
+	case "caldav":
+		principal, err := c.caldav.FindCurrentUserPrincipal(ctx)
+		if err == nil {
+			var home string
+			home, err = c.caldav.FindCalendarHomeSet(ctx, principal)
+			if err == nil {
+				var calendars []caldav.Calendar
+				calendars, err = c.caldav.FindCalendars(ctx, home)
+				if err == nil {
+					for _, calendar := range calendars {
+						result = append(result, Collection{Name: collectionName(calendar.Name, calendar.Path, "Calendar"), RemoteID: calendar.Path, URL: c.resolve(calendar.Path), Kind: "calendar"})
+					}
+				}
+			}
+		}
+		discoveryErr = err
+	}
+	if len(result) > 0 {
+		return result, nil
+	}
+	// Explicit collection URLs are useful for servers with incomplete
+	// principal discovery. Autodiscovered endpoints must pass discovery.
+	if c.account.URL == "" {
+		return nil, fmt.Errorf("discover %s collections: %w", c.account.Protocol, discoveryErr)
+	}
+	collectionPath := c.endpoint.Path
+	if collectionPath == "" {
+		collectionPath = "/"
+	}
+	if _, err := c.webdav.Stat(ctx, collectionPath); err != nil {
+		return nil, errors.Join(discoveryErr, fmt.Errorf("inspect explicit DAV collection: %w", err))
+	}
+	kind, fallback := "contact", "Contacts"
+	if c.account.Protocol == "caldav" {
+		kind, fallback = "calendar", "Calendar"
+	}
+	return []Collection{{Name: collectionName("", collectionPath, fallback), RemoteID: collectionPath, URL: c.resolve(collectionPath), Kind: kind}}, nil
+}
+
+func (c *Client) Objects(ctx context.Context, collection Collection) ([]Object, string, error) {
+	entries, err := c.webdav.ReadDir(ctx, collection.RemoteID, false)
+	if err != nil {
+		return nil, "", err
+	}
+	result := make([]Object, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir || samePath(entry.Path, collection.RemoteID) {
+			continue
+		}
+		result = append(result, Object{RemoteID: entry.Path, URL: c.resolve(entry.Path), ETag: entry.ETag, ContentType: entry.MIMEType})
+	}
+	return result, "", nil
+}
+
+func (c *Client) Get(ctx context.Context, object Object) (io.ReadCloser, string, error) {
+	body, err := c.webdav.Open(ctx, object.RemoteID)
+	if err != nil {
+		return nil, "", err
+	}
+	contentType := object.ContentType
+	if contentType == "" {
+		if c.account.Protocol == "carddav" {
+			contentType = "text/vcard"
+		} else {
+			contentType = "text/calendar"
+		}
+	}
+	return body, contentType, nil
+}
+
+// Put sends the archived bytes unchanged. The typed DAV helpers re-encode
+// parsed objects, and webdav.Client.Create omits the media type.
+func (c *Client) Put(ctx context.Context, collectionURL, kind, contentType string, body io.Reader) (string, error) {
+	collectionPath := collectionURL
+	if parsed, err := url.Parse(collectionURL); err == nil && parsed.Path != "" {
+		collectionPath = parsed.Path
+	}
+	extension := ".vcf"
+	if kind == "calendar" {
+		extension = ".ics"
+	}
+	target := strings.TrimSuffix(collectionPath, "/") + "/pimbackup-" + uuid.New().String() + extension
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.resolve(target), io.NopCloser(body))
+	if err != nil {
+		return "", err
+	}
+	if contentType == "" {
+		if kind == "calendar" {
+			contentType = "text/calendar"
+		} else {
+			contentType = "text/vcard"
+		}
+	}
+	request.Header.Set("Content-Type", contentType)
+	if seeker, ok := body.(io.Seeker); ok {
+		current, currentErr := seeker.Seek(0, io.SeekCurrent)
+		end, endErr := seeker.Seek(0, io.SeekEnd)
+		_, restoreErr := seeker.Seek(current, io.SeekStart)
+		if currentErr == nil && endErr == nil && restoreErr == nil && end >= current {
+			request.ContentLength = end - current
+		}
+	}
+	setAuth(request, c.account)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", fmt.Errorf("DAV restore returned HTTP %d", response.StatusCode)
+	}
+	if location := response.Header.Get("Location"); location != "" {
+		parsed, parseErr := url.Parse(location)
+		if parseErr != nil {
+			return "", fmt.Errorf("parse DAV restore location: %w", parseErr)
+		}
+		return response.Request.URL.ResolveReference(parsed).String(), nil
+	}
+	return c.resolve(target), nil
+}
+
+func (c *Client) resolve(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return value
+	}
+	return c.endpoint.ResolveReference(parsed).String()
+}
+func collectionName(name, value, fallback string) string {
+	if strings.TrimSpace(name) != "" {
+		return name
+	}
+	if base := path.Base(strings.TrimSuffix(value, "/")); base != "." && base != "/" && base != "" {
+		return base
+	}
+	return fallback
+}
+func samePath(left, right string) bool {
+	return strings.TrimSuffix(left, "/") == strings.TrimSuffix(right, "/")
+}
+
+type authenticatedClient struct {
+	client  *http.Client
+	account config.AccountConfig
+}
+
+func (c authenticatedClient) Do(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header = request.Header.Clone()
+	setAuth(clone, c.account)
+	return c.client.Do(clone)
+}
+func setAuth(request *http.Request, account config.AccountConfig) {
+	if account.Auth == "bearer" {
+		request.Header.Set("Authorization", "Bearer "+account.ResolvedToken)
+	} else {
+		request.SetBasicAuth(account.Username, account.ResolvedPassword)
+	}
+}
