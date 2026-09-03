@@ -1,6 +1,6 @@
 # Backup suite specification
 
-Status: PIM Backup implements IMAP and JMAP Mail, CardDAV contacts, and CalDAV calendars. Cloud Backup implements rclone acquisition, local browse, verification, restore export, diagnostics, scheduling, and its HTTP API. Application Backup remains a command scaffold.
+Status: PIM Backup implements IMAP and JMAP Mail, CardDAV contacts, and CalDAV calendars. Cloud Backup implements rclone acquisition, local browse, verification, restore export, diagnostics, scheduling, and its HTTP API. Application Backup implements Restic recovery points, native database dumps, hooks, staged restore, verification, diagnostics, scheduling, and its HTTP API.
 
 This file is the product and implementation specification for the suite.
 
@@ -32,11 +32,12 @@ The checked-in code follows this shape:
 │   └── pimbackup/          # pimbackup process entry point
 ├── configs/                # example declarative configuration
 ├── internal/
-│   ├── appbackup/          # Application Backup command scaffold
+│   ├── appbackup/          # Application Backup service and process boundaries
 │   ├── atomicfile/         # durable temporary write, fsync, and rename
 │   ├── buildinfo/          # shared build metadata
 │   ├── cloudbackup/        # Cloud Backup service and rclone process boundary
 │   ├── configutil/         # strict JSON, duration, and environment parsing
+│   ├── httpapi/            # bounded JSON requests, responses, and pagination
 │   ├── logging/            # shared slog construction
 │   ├── operationlock/      # process-local and filesystem operation lock
 │   ├── pimbackup/
@@ -49,6 +50,7 @@ The checked-in code follows this shape:
 │   │   ├── objectstore/    # JMAP .eml, vCard, and iCalendar files
 │   │   └── model/          # PIM request, response, and catalog records
 │   ├── run/                # shared operation and status vocabulary
+│   ├── safeerror/          # bounded single-line error text
 │   └── secret/             # shared direct value and *_FILE resolution
 ├── SPEC.md
 └── go.mod
@@ -77,14 +79,15 @@ The first PIM implementation may keep code local until a second tool needs it. E
 | Run vocabulary | `backup`, `verify`, and `restore` operations; queued, running, terminal, and interrupted states | Run detail, resource identifiers, progress, and catalog persistence | `internal/run` exists |
 | Configuration loading | Strict bounded JSON, duplicate detection, duration parsing, and environment booleans | Config structs, defaults, environment prefix, semantic validation, and redaction | Shared mechanics are in `internal/configutil`; schemas remain tool-owned |
 | Logging | Construct `slog` and choose level and format | Domain event names and safe fields | Shared construction is in `internal/logging` |
-| Process lifecycle | Signal cancellation, bounded shutdown, and startup cleanup | Closing protocol sessions and external processes | Implemented separately for PIM and Cloud |
-| HTTP mechanics | Timeouts, body limits, JSON errors, common health/version/run routes | Resource, browse, backup, verification, and restore request bodies | Implemented separately for PIM and Cloud |
-| Health and diagnostics | Aggregate named checks and stable statuses | IMAP login, rclone remote, Restic repository, database, and engine checks | Implemented for PIM and Cloud |
-| Scheduling | Fixed intervals, cancellation, no overlapping scheduled run | Which configured accounts, sources, or applications a tick selects | Implemented separately for PIM and Cloud |
+| Process lifecycle | Signal cancellation, bounded shutdown, and startup cleanup | Closing protocol sessions and external processes | Implemented separately by all three tools |
+| HTTP mechanics | Strict bounded JSON bodies, JSON responses, and pagination | Authentication, routes, service errors, and domain request bodies | Shared mechanics are in `internal/httpapi`; handlers remain tool-owned |
+| Health and diagnostics | Aggregate named checks and stable statuses | IMAP login, rclone remote, Restic repository, database, and engine checks | Implemented by all three tools |
+| Scheduling | Fixed intervals, cancellation, no overlapping scheduled run | Which configured accounts, sources, or applications a tick selects | Implemented separately by all three tools |
 | Operation locking | Process-local exclusion and a lock beneath `/data` for cron versus server races | Lock filename, conflict wording, and whether a domain read can coexist with an operation | Shared gate is in `internal/operationlock` |
-| Durable files | Same-filesystem temporary files, file sync, atomic rename, and parent directory sync | Canonical names, payload validation, and reconciliation | Shared atomic writes are used by PIM and Cloud; payload rules remain tool-owned |
-| Verification flow | Start and finish a run, cancellation, report envelope, safe error recording | Every integrity check and test restore | Implemented separately for PIM and Cloud |
-| SQLite mechanics | Connection settings and transaction helpers only if more than one tool needs identical behavior | Schema, queries, cursors, and reconciliation | PIM and Cloud keep separate catalogs and schemas |
+| Durable files | Same-filesystem temporary files, file sync, atomic rename, and parent directory sync | Canonical names, payload validation, and reconciliation | All three tools use shared atomic writes; payload rules remain tool-owned |
+| Safe errors | Remove line breaks and bound persisted or returned error text | Choosing which failures are safe to expose | Shared mechanics are in `internal/safeerror` |
+| Verification flow | Start and finish a run, cancellation, and report envelopes | Every integrity check and test restore | Implemented separately by all three tools |
+| SQLite mechanics | Connection settings and transaction helpers only if more than one tool needs identical behavior | Schema, queries, cursors, and reconciliation | Each tool keeps its own catalog and schema |
 
 The following must not become shared suite abstractions:
 
@@ -305,7 +308,7 @@ Application Backup coordinates a declared recovery point. Restic owns filesystem
 - Optional Docker or Podman inspection and short-lived verification containers.
 - Matching a dump with a compatible verification server version.
 - Recovery ordering and partial-failure reporting.
-- Browse results that join manifests, Restic snapshots, dumps, and verification reports.
+- Browse results that join recovery-point manifests and Restic snapshot contents.
 
 The expected layout is:
 
@@ -315,8 +318,7 @@ The expected layout is:
 ├── restic/
 ├── recovery-points/
 │   └── <recovery-point-id>/
-│       ├── manifest.json
-│       └── verification.json
+│       └── manifest.json
 ├── staging/
 └── restores/
 ```
@@ -334,9 +336,9 @@ run configured verification
 record final status
 ```
 
-Cleanup hooks run after a failure whenever their precondition ran. The manifest records tool versions, component results, Restic snapshot IDs, dump metadata, hook outcomes, and verification status. It never records command environments or secret arguments.
+Cleanup hooks run after a failure whenever their precondition ran. The manifest records tool versions, component results, Restic snapshot IDs, dump metadata, hook outcomes, and the latest verification report. It never records command environments or secret arguments.
 
-A dump is not verified merely because it exists. PostgreSQL and MariaDB or MySQL verification should restore into an ephemeral compatible instance, then run connection and basic integrity checks. Container-based verification is opt-in and requires an explicitly configured Docker or Podman socket. The diagnostics command must warn that access to an engine socket is equivalent to broad host privilege. Native installations may use local clients or an operator-supplied verification command.
+A dump is not verified merely because it exists. SQLite verification runs `PRAGMA quick_check` against the restored dump. PostgreSQL archive listing checks and MariaDB or MySQL dump hashes remain `unknown` unless the database has an operator-supplied `verify_command` that restores into a compatible instance and runs integrity checks. Container-based verification is opt-in through that command and requires an explicitly configured Docker or Podman socket. The diagnostics command warns that access to an engine socket is equivalent to broad host privilege.
 
 SQLite backup uses SQLite's supported backup mechanisms or a native utility, not a copy of a live database file unless the application is stopped and configuration says the copy is safe.
 
@@ -351,7 +353,7 @@ The Application Backup image is custom per supported client set. It includes pin
 | Remote access | IMAP, JMAP, CardDAV, CalDAV clients | rclone read operations | Database, Restic, Docker, and Podman clients |
 | Durable payload | `.eml`, `.vcf`, `.ics`, documented sidecars | Normal files and manifests | Restic repository, native dumps, recovery manifests |
 | Incremental state | UIDs, UIDVALIDITY, JMAP states, ETags, sync tokens | rclone listings and acquisition manifests | Restic snapshot IDs and component completion |
-| Catalog | PIM resources and protocol identities | Sources, files, and acquisitions | Applications, components, and recovery points |
+| Catalog | PIM resources and protocol identities | Sources, files, and acquisitions | Applications and recovery-point browse fields |
 | Browse | Mailboxes, messages, contacts, calendars | Source trees and file metadata | Recovery points, components, and Restic contents |
 | Verify | Parse standards files and reconcile identities | Rehash files and compare manifests | Restic checks and test-restored databases |
 | Restore | Protocol-aware append or standards export | Local export only | Staged or explicit component restore |
@@ -375,7 +377,7 @@ Every restore path needs an automated round trip before its backup path is calle
 2. Add configuration, logging, lifecycle, locking, run persistence, and durable-file code only as the IMAP slice needs them.
 3. Keep IMAP, JMAP Mail, CardDAV, and CalDAV backup, browse, verify, restore, reconciliation, and `db rebuild` covered by round-trip tests.
 4. Keep Cloud Backup's rclone process boundary read-only on the remote side.
-5. Build Application Backup around Restic and native database clients.
+5. Keep Application Backup's Restic, database, hook, and container engine process boundaries separate.
 6. Extract more shared code only after the second real use proves identical behavior.
 
 PIM Backup currently uses go-imap v2, go-jmap, go-webdav, gofrs flock, and modernc SQLite. Before the first published release, the catalog creates the current schema directly. The HTTP API uses an optional bearer token and refuses an unauthenticated non-loopback listener unless configuration explicitly allows it.

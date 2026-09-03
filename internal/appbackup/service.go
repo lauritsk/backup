@@ -1,4 +1,4 @@
-package cloudbackup
+package appbackup
 
 import (
 	"context"
@@ -10,31 +10,54 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lauritsk/backup/internal/cloudbackup/catalog"
-	"github.com/lauritsk/backup/internal/cloudbackup/config"
-	"github.com/lauritsk/backup/internal/cloudbackup/model"
-	rcloneprocess "github.com/lauritsk/backup/internal/cloudbackup/rclone"
+	"github.com/lauritsk/backup/internal/appbackup/catalog"
+	"github.com/lauritsk/backup/internal/appbackup/config"
+	databaseprocess "github.com/lauritsk/backup/internal/appbackup/database"
+	engineprocess "github.com/lauritsk/backup/internal/appbackup/engine"
+	hookprocess "github.com/lauritsk/backup/internal/appbackup/hooks"
+	"github.com/lauritsk/backup/internal/appbackup/model"
+	resticprocess "github.com/lauritsk/backup/internal/appbackup/restic"
 	"github.com/lauritsk/backup/internal/operationlock"
 	runmodel "github.com/lauritsk/backup/internal/run"
 	"github.com/lauritsk/backup/internal/safeerror"
 )
 
-type Rclone interface {
-	Version(context.Context) error
-	CheckSource(context.Context, config.SourceConfig) error
-	Copy(context.Context, config.SourceConfig, string) error
+type Restic interface {
+	Version(context.Context) (string, error)
+	EnsureRepository(context.Context) error
+	Check(context.Context) error
+	Backup(context.Context, []string, []string) (string, error)
+	Restore(context.Context, string, string) error
+	List(context.Context, string, int, int) ([]string, error)
+}
+type Databases interface {
+	Version(context.Context, config.DatabaseConfig) (string, error)
+	Dump(context.Context, config.DatabaseConfig, string) error
+	VerifyDump(context.Context, config.DatabaseConfig, string) (string, error)
+	Check(context.Context, config.DatabaseConfig) error
+}
+type Hooks interface {
+	Run(context.Context, config.CommandConfig) error
+}
+type Engine interface {
+	Check(context.Context, config.EngineConfig) error
 }
 
 type ServiceOptions struct {
-	Rclone Rclone
-	Logger *slog.Logger
+	Restic    Restic
+	Databases Databases
+	Hooks     Hooks
+	Engine    Engine
+	Logger    *slog.Logger
 }
-
 type Service struct {
 	config          config.Config
 	catalog         *catalog.Catalog
 	store           *fileStore
-	rclone          Rclone
+	restic          Restic
+	databases       Databases
+	hooks           Hooks
+	engine          Engine
 	gate            *operationlock.Gate
 	logger          *slog.Logger
 	ctx             context.Context
@@ -44,7 +67,7 @@ type Service struct {
 	initialized     atomic.Bool
 }
 
-var ErrOperationBusy = errors.New("another cloud backup, verification, or restore is already running")
+var ErrOperationBusy = errors.New("another application backup, verification, or restore is already running")
 
 func OpenService(ctx context.Context, cfg config.Config, options ServiceOptions) (*Service, error) {
 	if options.Logger == nil {
@@ -59,16 +82,25 @@ func OpenService(ctx context.Context, cfg config.Config, options ServiceOptions)
 		cat.Close()
 		return nil, err
 	}
-	gate, err := operationlock.New(cfg.DataDir, ".cloudbackup.lock", ErrOperationBusy)
+	gate, err := operationlock.New(cfg.DataDir, ".appbackup.lock", ErrOperationBusy)
 	if err != nil {
 		cat.Close()
 		return nil, err
 	}
-	if options.Rclone == nil {
-		options.Rclone = rcloneprocess.Runner{Binary: cfg.Rclone.Binary, ConfigPath: cfg.Rclone.ConfigPath, DataDir: cfg.DataDir}
+	if options.Restic == nil {
+		options.Restic = resticprocess.Runner{Binary: cfg.Restic.Binary, Repository: cfg.Restic.Repository, Password: cfg.Restic.ResolvedPassword, DataDir: cfg.DataDir, Timeout: cfg.Restic.Timeout.Duration}
 	}
-	serviceContext, cancel := context.WithCancel(ctx)
-	service := &Service{config: cfg, catalog: cat, store: store, rclone: options.Rclone, gate: gate, logger: options.Logger, ctx: serviceContext, cancel: cancel}
+	if options.Databases == nil {
+		options.Databases = databaseprocess.Runner{DataDir: cfg.DataDir}
+	}
+	if options.Hooks == nil {
+		options.Hooks = hookprocess.Runner{}
+	}
+	if options.Engine == nil {
+		options.Engine = engineprocess.Runner{}
+	}
+	serviceCtx, cancel := context.WithCancel(ctx)
+	service := &Service{config: cfg, catalog: cat, store: store, restic: options.Restic, databases: options.Databases, hooks: options.Hooks, engine: options.Engine, gate: gate, logger: options.Logger, ctx: serviceCtx, cancel: cancel}
 	release, err := gate.TryAcquire()
 	if errors.Is(err, ErrOperationBusy) {
 		return service, nil
@@ -85,7 +117,6 @@ func OpenService(ctx context.Context, cfg config.Config, options ServiceOptions)
 	}
 	return service, nil
 }
-
 func (s *Service) ensureInitialized(ctx context.Context) error {
 	s.initializeMutex.Lock()
 	defer s.initializeMutex.Unlock()
@@ -98,43 +129,61 @@ func (s *Service) ensureInitialized(ctx context.Context) error {
 	s.initialized.Store(true)
 	return nil
 }
-
 func (s *Service) initialize(ctx context.Context) error {
 	if count, err := s.catalog.MarkInterrupted(ctx); err != nil {
 		return err
 	} else if count > 0 {
 		s.logger.Warn("marked unfinished runs as interrupted", "runs", count)
 	}
-	for _, source := range s.config.Sources {
-		if err := s.catalog.UpsertSource(ctx, source.ID, source.Remote); err != nil {
-			return err
-		}
-		if _, err := s.store.prepareSource(source.ID); err != nil {
+	for _, app := range s.config.Applications {
+		if err := s.catalog.UpsertApplication(ctx, app.ID); err != nil {
 			return err
 		}
 	}
-	manifests, err := s.store.readLatestManifests(ctx)
+	points, err := s.store.readRecoveryPoints(ctx)
 	if err != nil {
 		return err
 	}
-	for _, manifest := range manifests {
-		if err := s.catalog.ApplyManifest(ctx, manifest); err != nil {
+	for _, point := range points {
+		if point.Status == "running" {
+			var cleanupErr error
+			application, found := s.config.Application(point.ApplicationID)
+			if found {
+				if phaseStarted(point.Hooks, config.HookQuiesce) {
+					cleanupErr = errors.Join(cleanupErr, s.runHookPhase(ctx, config.HookUnquiesce, application.Hooks.Unquiesce, &point))
+				}
+				cleanupErr = errors.Join(cleanupErr, s.runHookPhase(ctx, config.HookPostBackup, application.Hooks.PostBackup, &point))
+			} else {
+				cleanupErr = errors.New("application is no longer configured, so cleanup hooks could not run")
+			}
+			point.Status = "interrupted"
+			point.Error = "process stopped before the recovery point completed"
+			if cleanupErr != nil {
+				point.Error = safeerror.Clean(errors.Join(errors.New(point.Error), cleanupErr)).Error()
+			}
+			point.CompletedAt = nowPointer()
+			if _, err := s.store.writeRecoveryPoint(point); err != nil {
+				return err
+			}
+		}
+		path, err := s.store.manifestPath(point.ID)
+		if err != nil {
+			return err
+		}
+		if err := s.catalog.ApplyRecoveryPoint(ctx, point, path); err != nil {
 			return err
 		}
 	}
-	return nil
+	return s.store.cleanStaging()
 }
-
 func (s *Service) Close() error {
 	s.cancel()
 	s.async.Wait()
 	return errors.Join(s.gate.Close(), s.catalog.Close())
 }
-
 func (s *Service) Config() config.Config { return s.config }
 
 type operationAction func(context.Context, string) (any, error)
-
 type preparedOperation struct {
 	service *Service
 	run     catalog.Run
@@ -158,7 +207,6 @@ func (s *Service) prepare(ctx context.Context, operation runmodel.Operation, req
 	}
 	return &preparedOperation{service: s, run: run, release: release, action: action}, nil
 }
-
 func (p *preparedOperation) execute(ctx context.Context) (result catalog.Run, resultErr error) {
 	defer func() { resultErr = errors.Join(resultErr, p.release()) }()
 	if err := p.service.catalog.StartRun(context.Background(), p.run.ID); err != nil {
@@ -180,7 +228,6 @@ func (p *preparedOperation) execute(ctx context.Context) (result catalog.Run, re
 	finished, err := p.service.catalog.GetRun(finishCtx, p.run.ID)
 	return finished, errors.Join(operationErr, err)
 }
-
 func invokeOperation(ctx context.Context, runID string, action operationAction) (detail any, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -189,7 +236,6 @@ func invokeOperation(ctx context.Context, runID string, action operationAction) 
 	}()
 	return action(ctx, runID)
 }
-
 func (p *preparedOperation) queue() {
 	p.service.async.Add(1)
 	go func() {
@@ -223,23 +269,18 @@ func (s *Service) submit(ctx context.Context, operation runmodel.Operation, requ
 func (s *Service) Backup(ctx context.Context, request model.BackupRequest) (catalog.Run, error) {
 	return s.submit(ctx, runmodel.OperationBackup, request, func(runCtx context.Context, runID string) (any, error) { return s.backup(runCtx, runID, request) }, executeNow)
 }
-
 func (s *Service) QueueBackup(ctx context.Context, request model.BackupRequest) (catalog.Run, error) {
 	return s.submit(ctx, runmodel.OperationBackup, request, func(runCtx context.Context, runID string) (any, error) { return s.backup(runCtx, runID, request) }, executeQueued)
 }
-
 func (s *Service) Verify(ctx context.Context, request model.VerifyRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationVerify, request, func(runCtx context.Context, _ string) (any, error) { return s.verify(runCtx, request) }, executeNow)
+	return s.submit(ctx, runmodel.OperationVerify, request, func(runCtx context.Context, runID string) (any, error) { return s.verify(runCtx, runID, request) }, executeNow)
 }
-
 func (s *Service) QueueVerify(ctx context.Context, request model.VerifyRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationVerify, request, func(runCtx context.Context, _ string) (any, error) { return s.verify(runCtx, request) }, executeQueued)
+	return s.submit(ctx, runmodel.OperationVerify, request, func(runCtx context.Context, runID string) (any, error) { return s.verify(runCtx, runID, request) }, executeQueued)
 }
-
 func (s *Service) Restore(ctx context.Context, request model.RestoreRequest) (catalog.Run, error) {
 	return s.submit(ctx, runmodel.OperationRestore, request, func(runCtx context.Context, runID string) (any, error) { return s.restore(runCtx, runID, request) }, executeNow)
 }
-
 func (s *Service) QueueRestore(ctx context.Context, request model.RestoreRequest) (catalog.Run, error) {
 	return s.submit(ctx, runmodel.OperationRestore, request, func(runCtx context.Context, runID string) (any, error) { return s.restore(runCtx, runID, request) }, executeQueued)
 }
