@@ -1,5 +1,7 @@
 [tools]
+actionlint = "latest"
 go = "latest"
+"go:golang.org/x/vuln/cmd/govulncheck" = "latest"
 rclone = "latest"
 restic = "latest"
 sqlite = "latest"
@@ -27,6 +29,22 @@ fi
 description = "Tidy Go dependencies"
 run = "go mod tidy"
 
+[tasks."deps:check"]
+description = "Check that Go module files are tidy"
+run = "go mod tidy -diff"
+
+[tasks."deps:update"]
+description = "Update Go dependencies"
+run = "go get -u ./... && go mod tidy"
+
+[tasks.audit]
+description = "Scan Go dependencies for known vulnerabilities"
+run = "govulncheck ./..."
+
+[tasks."workflow:check"]
+description = "Lint GitHub Actions workflows"
+run = "actionlint"
+
 [tasks.test]
 description = "Run tests"
 run = "go test ./..."
@@ -46,7 +64,7 @@ run = "go vet ./..."
 
 [tasks.check]
 description = "Run local checks and build"
-depends = ["fmt:check", "test", "vet", "build"]
+depends = ["audit", "deps:check", "fmt:check", "workflow:check", "test", "vet", "build"]
 
 [tasks.clean]
 description = "Remove generated files"
