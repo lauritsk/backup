@@ -12,7 +12,7 @@ import (
 func TestStartupReappliesOnlyLatestManifestAndKeepsVerification(t *testing.T) {
 	dataDir := t.TempDir()
 	remote := fakeRclone{files: map[string]string{"file.txt": "contents"}}
-	cfg := config.Config{DataDir: dataDir, Rclone: config.RcloneConfig{Binary: "rclone"}, Sources: []config.SourceConfig{{ID: "source", Remote: "test:", Timeout: config.Duration{Duration: time.Minute}}}}
+	cfg := config.Config{DataDir: dataDir, Rclone: config.RcloneConfig{}, Sources: []config.SourceConfig{{ID: "source", Remote: "test:", Timeout: config.Duration{Duration: time.Minute}}}}
 
 	service, err := OpenService(context.Background(), cfg, ServiceOptions{Rclone: remote})
 	if err != nil {

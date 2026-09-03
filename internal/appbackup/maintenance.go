@@ -109,8 +109,5 @@ func (s *Service) configExecutables() []configuredExecutable {
 			}
 		}
 	}
-	if s.config.Engine != nil {
-		result = append(result, configuredExecutable{"engine_binary", s.config.Engine.Binary})
-	}
 	return result
 }

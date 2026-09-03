@@ -79,21 +79,14 @@ func normalize(cfg *Config) {
 				switch database.Type {
 				case "postgresql":
 					database.Binary = "pg_dump"
-				case "mysql", "mariadb":
+				case "mysql":
 					database.Binary = "mysqldump"
-				case "sqlite":
-					database.Binary = "sqlite3"
+				case "mariadb":
+					database.Binary = "mariadb-dump"
 				}
 			}
-			if database.RestoreBinary == "" {
-				switch database.Type {
-				case "postgresql":
-					database.RestoreBinary = "pg_restore"
-				case "mysql", "mariadb":
-					database.RestoreBinary = "mysql"
-				case "sqlite":
-					database.RestoreBinary = "sqlite3"
-				}
+			if database.Type == "postgresql" && database.RestoreBinary == "" {
+				database.RestoreBinary = "pg_restore"
 			}
 			normalizeCommand(database.VerifyCommand)
 		}
@@ -104,9 +97,6 @@ func normalize(cfg *Config) {
 				}
 			}
 		}
-	}
-	if cfg.Engine != nil && cfg.Engine.Binary == "" {
-		cfg.Engine.Binary = cfg.Engine.Type
 	}
 }
 

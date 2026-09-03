@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadValidateAndRedact(t *testing.T) {
@@ -32,6 +33,42 @@ func TestLoadValidateAndRedact(t *testing.T) {
 	}
 }
 
+func TestNormalizeOnlyConfiguresRequiredDatabaseClients(t *testing.T) {
+	cfg := defaults()
+	cfg.Applications = []ApplicationConfig{{Databases: []DatabaseConfig{
+		{Type: "sqlite"},
+		{Type: "mysql"},
+		{Type: "mariadb"},
+		{Type: "postgresql"},
+	}}}
+	normalize(&cfg)
+	databases := cfg.Applications[0].Databases
+	if databases[0].Binary != "" || databases[0].RestoreBinary != "" {
+		t.Fatalf("SQLite clients = %#v", databases[0])
+	}
+	if databases[1].Binary != "mysqldump" || databases[1].RestoreBinary != "" {
+		t.Fatalf("MySQL clients = %#v", databases[1])
+	}
+	if databases[2].Binary != "mariadb-dump" || databases[2].RestoreBinary != "" {
+		t.Fatalf("MariaDB clients = %#v", databases[2])
+	}
+	if databases[3].Binary != "pg_dump" || databases[3].RestoreBinary != "pg_restore" {
+		t.Fatalf("PostgreSQL clients = %#v", databases[3])
+	}
+}
+
+func TestValidateDatabaseDoesNotRequireSQLiteOrMySQLRestoreBinaries(t *testing.T) {
+	minute := Duration{Duration: time.Minute}
+	for _, database := range []DatabaseConfig{
+		{ID: "sqlite", Type: "sqlite", Path: "/srv/app.sqlite", Timeout: minute},
+		{ID: "mysql", Type: "mysql", Binary: "mysqldump", Name: "app", Timeout: minute},
+	} {
+		if err := validateDatabase(database); err != nil {
+			t.Fatalf("validateDatabase(%s): %v", database.Type, err)
+		}
+	}
+}
+
 func TestValidateRejectsPathOverlappingData(t *testing.T) {
 	cfg := defaults()
 	cfg.Restic.ResolvedPassword = "secret"
@@ -42,10 +79,10 @@ func TestValidateRejectsPathOverlappingData(t *testing.T) {
 }
 
 func TestEffectiveVerificationCommandUsesConfiguredEngine(t *testing.T) {
-	cfg := Config{Engine: &EngineConfig{Type: "docker", Binary: "/usr/local/bin/docker", Socket: "/run/docker.sock"}}
+	cfg := Config{Engine: &EngineConfig{Type: "docker", Socket: "/run/docker.sock"}}
 	database := DatabaseConfig{VerifyCommand: &CommandConfig{Binary: "docker", Args: []string{"run", "{dump}"}}}
 	command := cfg.EffectiveVerificationCommand(database)
-	if command.Binary != cfg.Engine.Binary || strings.Join(command.Args, " ") != "--host unix:///run/docker.sock run {dump}" {
+	if command.Binary != "docker" || strings.Join(command.Args, " ") != "--host unix:///run/docker.sock run {dump}" {
 		t.Fatalf("effective command = %#v", command)
 	}
 	if database.VerifyCommand.Binary != "docker" || len(database.VerifyCommand.Args) != 2 {

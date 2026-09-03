@@ -3,6 +3,7 @@ package pimbackup
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"git.sr.ht/~rockorager/go-jmap/mail"
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
@@ -223,6 +225,101 @@ func TestIMAPBackupVerifyAndRestore(t *testing.T) {
 	}
 	if _, err := recovered.Backup(context.Background(), model.BackupRequest{}); err != nil {
 		t.Fatalf("backup after SQLite recovery = %v", err)
+	}
+}
+
+func TestJMAPBackupChangesVerifyAndRebuild(t *testing.T) {
+	const raw = "From: sender@example.test\r\nTo: user@example.test\r\nSubject: JMAP integration\r\n\r\nBody\r\n"
+	var downloads atomic.Int32
+	var changes atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer token" {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/session":
+			_ = json.NewEncoder(writer).Encode(map[string]any{"apiUrl": server.URL + "/api", "downloadUrl": server.URL + "/download/{accountId}/{blobId}/{name}", "uploadUrl": server.URL + "/upload/{accountId}", "capabilities": map[string]any{string(mail.URI): map[string]any{}, "urn:ietf:params:jmap:core": map[string]any{}}, "primaryAccounts": map[string]string{string(mail.URI): "account"}, "accounts": map[string]any{"account": map[string]any{}}})
+		case request.Method == http.MethodPost && request.URL.Path == "/api":
+			var envelope struct {
+				MethodCalls [][]json.RawMessage `json:"methodCalls"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&envelope); err != nil {
+				t.Error(err)
+				return
+			}
+			var method string
+			_ = json.Unmarshal(envelope.MethodCalls[0][0], &method)
+			var response any
+			switch method {
+			case "Mailbox/get":
+				response = map[string]any{"accountId": "account", "state": "mailboxes", "list": []any{map[string]any{"id": "inbox", "name": "Inbox"}}}
+			case "Email/query":
+				response = map[string]any{"accountId": "account", "queryState": "query", "position": 0, "ids": []string{"email"}, "total": 1}
+			case "Email/get":
+				response = map[string]any{"accountId": "account", "state": "email-state", "list": []any{map[string]any{"id": "email", "blobId": "blob", "subject": "JMAP integration", "keywords": map[string]bool{"$seen": true}, "mailboxIds": map[string]bool{"inbox": true}}}, "notFound": []string{}}
+			case "Email/changes":
+				changes.Add(1)
+				response = map[string]any{"accountId": "account", "oldState": "email-state", "newState": "email-state", "hasMoreChanges": false, "created": []string{}, "updated": []string{}, "destroyed": []string{}}
+			case "Email/import":
+				var arguments map[string]any
+				_ = json.Unmarshal(envelope.MethodCalls[0][1], &arguments)
+				created := map[string]any{}
+				for creationID := range arguments["emails"].(map[string]any) {
+					created[creationID] = map[string]any{"id": "restored"}
+				}
+				response = map[string]any{"accountId": "account", "created": created}
+			default:
+				t.Errorf("unexpected JMAP method %q", method)
+				http.Error(writer, "unexpected method", http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"methodResponses": []any{[]any{method, response, "call"}}})
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/download/account/blob/"):
+			downloads.Add(1)
+			writer.Header().Set("Content-Type", "message/rfc822")
+			_, _ = io.WriteString(writer, raw)
+		case request.Method == http.MethodPost && request.URL.Path == "/upload/account":
+			uploaded, _ := io.ReadAll(request.Body)
+			if string(uploaded) != raw {
+				t.Errorf("JMAP restored body = %q", uploaded)
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"accountId": "account", "blobId": "uploaded", "type": "message/rfc822", "size": len(raw)})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Config{DataDir: t.TempDir(), Accounts: []config.AccountConfig{{ID: "jmap", Protocol: "jmap", URL: server.URL + "/session", Auth: "bearer", ResolvedToken: "token", Collections: []string{"*"}, Timeout: config.Duration{Duration: 5 * time.Second}}}}
+	service, err := OpenService(context.Background(), cfg, ServiceOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	if run, err := service.Backup(context.Background(), model.BackupRequest{}); err != nil || run.Status != runmodel.StatusSucceeded {
+		t.Fatalf("Backup() = %#v, %v", run, err)
+	}
+	objects, err := service.ListObjects(context.Background(), model.ObjectFilter{AccountID: "jmap", Kind: "mail", Limit: 10})
+	if err != nil || len(objects) != 1 || objects[0].Title != "JMAP integration" {
+		t.Fatalf("objects = %#v, %v", objects, err)
+	}
+	if _, err := service.Backup(context.Background(), model.BackupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if downloads.Load() != 1 || changes.Load() != 1 {
+		t.Fatalf("downloads=%d changes=%d", downloads.Load(), changes.Load())
+	}
+	if _, err := service.Verify(context.Background(), model.VerifyRequest{ObjectID: objects[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Restore(context.Background(), model.RestoreRequest{ObjectIDs: []int64{objects[0].ID}, TargetAccount: "jmap", TargetMailbox: "Inbox", Confirm: true}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := service.Rebuild(context.Background())
+	if err != nil || report.Collections != 1 || report.Objects != 1 {
+		t.Fatalf("Rebuild() = %#v, %v", report, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,70 @@ import (
 
 	"github.com/lauritsk/backup/internal/appbackup/config"
 )
+
+func TestSQLiteDumpAndVerificationUseEmbeddedDriver(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "live's.sqlite")
+	db, err := sql.Open("sqlite", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE items (value TEXT); INSERT INTO items VALUES ('before')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(source, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	runner := Runner{DataDir: dataDir}
+	database := config.DatabaseConfig{ID: "db", Type: "sqlite", Path: source, Timeout: config.Duration{Duration: time.Minute}}
+	version, err := runner.Version(context.Background(), database)
+	if err != nil || !strings.Contains(version, "modernc.org/sqlite") {
+		t.Fatalf("Version = %q, %v", version, err)
+	}
+	if err := runner.Check(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+	dump := filepath.Join(dataDir, "staging", "point", "database.sqlite")
+	if err := runner.Dump(context.Background(), database, dump); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("dump mode = %v", info.Mode().Perm())
+	}
+	status, err := runner.VerifyDump(context.Background(), database, dump)
+	if err != nil || status != "passed" {
+		t.Fatalf("VerifyDump = %q, %v", status, err)
+	}
+	copyDB, err := sql.Open("sqlite", dump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copyDB.Close()
+	var value string
+	if err := copyDB.QueryRow(`SELECT value FROM items`).Scan(&value); err != nil || value != "before" {
+		t.Fatalf("snapshot value = %q, %v", value, err)
+	}
+}
+
+func TestMySQLVersionDoesNotRequireRestoreClient(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "mysqldump")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\necho 'mysqldump 8.4'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := config.DatabaseConfig{Type: "mysql", Binary: binary}
+	version, err := (Runner{}).Version(context.Background(), database)
+	if err != nil || version != "mysqldump 8.4" {
+		t.Fatalf("Version = %q, %v", version, err)
+	}
+}
 
 func TestPostgreSQLDumpUsesPasswordEnvironment(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "pg-tool")

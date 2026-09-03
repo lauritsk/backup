@@ -3,6 +3,8 @@ package objectstore
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -73,6 +75,24 @@ func TestSaveRejectsInvalidStandardObject(t *testing.T) {
 	entries, err := os.ReadDir(store.accountsDir)
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("account data after failed save: %v, %v", entries, err)
+	}
+}
+
+func TestStoreRejectsSymlinkedCollectionPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior differs on Windows")
+	}
+	dataDir := t.TempDir()
+	store, err := New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(store.accountsDir, "personal")); err != nil {
+		t.Fatal(err)
+	}
+	collection := model.Collection{ID: 7, AccountID: "personal", Kind: "contact", Name: "People", RemoteID: "people"}
+	if _, err := store.Save(context.Background(), collection, "ada.vcf", "one", "text/vcard", Attributes{}, strings.NewReader(contact)); err == nil || !strings.Contains(err.Error(), "plain directory") {
+		t.Fatalf("Save() through symlink = %v", err)
 	}
 }
 

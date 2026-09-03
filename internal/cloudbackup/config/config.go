@@ -23,7 +23,7 @@ const (
 
 var idPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 var remotePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,126}:`)
-var bandwidthPattern = regexp.MustCompile(`^(off|[0-9]+(?:\.[0-9]+)?[bBkKmMgGtTpP]?(?:/[bBkKmMgGtTpP]?)?)$`)
+var bandwidthPattern = regexp.MustCompile(`^(off|[0-9]+(?:\.[0-9]+)?[bBkKmMgGtTpP]?(?:/[sS])?)$`)
 
 type Duration = configutil.Duration
 
@@ -38,7 +38,6 @@ type Config struct {
 }
 
 type RcloneConfig struct {
-	Binary     string `json:"binary"`
 	ConfigPath string `json:"config_path,omitempty"`
 }
 
@@ -108,7 +107,6 @@ func Load(overrides Overrides) (Config, error) {
 func defaults() Config {
 	return Config{
 		DataDir: "/data",
-		Rclone:  RcloneConfig{Binary: "rclone"},
 		Server: ServerConfig{
 			Listen:            "127.0.0.1:8080",
 			ReadHeaderTimeout: Duration{Duration: 5 * time.Second},
@@ -136,9 +134,6 @@ func decodeFile(filename string, explicit bool, target *Config) error {
 }
 
 func normalize(cfg *Config) {
-	if cfg.Rclone.Binary == "" {
-		cfg.Rclone.Binary = "rclone"
-	}
 	for index := range cfg.Sources {
 		if cfg.Sources[index].Timeout.Duration == 0 {
 			cfg.Sources[index].Timeout.Duration = 30 * time.Minute
@@ -152,7 +147,7 @@ func applyEnvironment(cfg *Config) error {
 		target *string
 	}{
 		{"CLOUDBACKUP_LISTEN", &cfg.Server.Listen}, {"CLOUDBACKUP_LOG_LEVEL", &cfg.Log.Level}, {"CLOUDBACKUP_LOG_FORMAT", &cfg.Log.Format},
-		{"CLOUDBACKUP_RCLONE_BINARY", &cfg.Rclone.Binary}, {"CLOUDBACKUP_RCLONE_CONFIG_PATH", &cfg.Rclone.ConfigPath},
+		{"CLOUDBACKUP_RCLONE_CONFIG_PATH", &cfg.Rclone.ConfigPath},
 	}
 	for _, item := range values {
 		if value, ok := os.LookupEnv(item.name); ok {
@@ -211,8 +206,8 @@ func (cfg Config) Validate() error {
 	if cfg.DataDir != "/data" {
 		problems = append(problems, "data_dir is fixed at /data")
 	}
-	if cfg.Rclone.Binary == "" || strings.ContainsRune(cfg.Rclone.Binary, 0) {
-		problems = append(problems, "rclone.binary cannot be empty")
+	if strings.ContainsAny(cfg.Rclone.ConfigPath, "\r\n\x00") {
+		problems = append(problems, "rclone.config_path cannot contain control characters")
 	}
 	if err := validateServer(cfg.Server); err != nil {
 		problems = append(problems, err.Error())

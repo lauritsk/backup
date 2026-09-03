@@ -130,13 +130,24 @@ ON CONFLICT(source_id,path) DO UPDATE SET
   sha256=excluded.sha256,
   mod_time=excluded.mod_time,
   last_run_id=excluded.last_run_id
-WHERE files.size<>excluded.size OR files.sha256<>excluded.sha256 OR files.mod_time<>excluded.mod_time OR files.last_run_id<>excluded.last_run_id
-`, manifest.SourceID, file.Path, file.Size, file.SHA256, formatTime(file.ModTime), manifest.RunID)
+WHERE (files.size<>excluded.size OR files.sha256<>excluded.sha256 OR files.mod_time<>excluded.mod_time OR files.last_run_id<>excluded.last_run_id)
+  AND NOT EXISTS (
+    SELECT 1 FROM runs AS current_run
+    WHERE current_run.id=files.last_run_id AND current_run.requested_at>?
+  )
+`, manifest.SourceID, file.Path, file.Size, file.SHA256, formatTime(file.ModTime), manifest.RunID, formatTime(manifest.CompletedAt))
 		if err != nil {
 			return fmt.Errorf("store manifest file %q: %w", file.Path, err)
 		}
 	}
 	return tx.Commit()
+}
+
+// ApplyFile records one durable payload before the source-level manifest is
+// finalized. A later run can recover without redownloading or trusting a
+// manifest that was never committed.
+func (c *Catalog) ApplyFile(ctx context.Context, runID, sourceID, remote string, file model.ManifestFile) error {
+	return c.ApplyManifest(ctx, model.Manifest{RunID: runID, SourceID: sourceID, Remote: remote, CompletedAt: time.Now().UTC(), Files: []model.ManifestFile{file}})
 }
 
 func (c *Catalog) GetFile(ctx context.Context, sourceID, path string) (model.File, error) {

@@ -1,111 +1,224 @@
-// Package rclone owns the Cloud Backup process boundary to rclone.
+// Package rclone provides read-only cloud access through rclone's Go packages.
 package rclone
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
+	"io"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync"
 
-	"github.com/lauritsk/backup/internal/cloudbackup/config"
+	_ "github.com/rclone/rclone/backend/all"
+	"github.com/rclone/rclone/fs"
+	rcloneconfig "github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configfile"
+	"github.com/rclone/rclone/fs/filter"
+	"github.com/rclone/rclone/fs/operations"
+	"golang.org/x/time/rate"
+
+	cloudconfig "github.com/lauritsk/backup/internal/cloudbackup/config"
+	"github.com/lauritsk/backup/internal/cloudbackup/model"
 )
 
+const maxInventoryBytes = 64 << 20
+
 type Runner struct {
-	Binary     string
 	ConfigPath string
-	DataDir    string
 }
 
-func (r Runner) Version(ctx context.Context) error {
-	return r.run(ctx, []string{"version"})
+var embeddedConfig struct {
+	sync.Mutex
+	installed bool
+	path      string
 }
 
-func (r Runner) CheckSource(ctx context.Context, source config.SourceConfig) error {
-	args := []string{"lsf", source.Remote, "--max-depth", "1"}
-	args = r.withConfig(args)
-	return r.run(ctx, args)
+func (r Runner) Version(context.Context) error {
+	return r.configure()
 }
 
-func (r Runner) Copy(ctx context.Context, source config.SourceConfig, destination string) error {
+func (r Runner) CheckSource(ctx context.Context, source cloudconfig.SourceConfig) error {
+	remote, err := r.open(ctx, source.Remote)
+	if err != nil {
+		return fmt.Errorf("open rclone source: %w", err)
+	}
+	if _, err := remote.List(ctx, ""); err != nil {
+		return fmt.Errorf("list rclone source: %w", err)
+	}
+	return nil
+}
+
+func (r Runner) Inventory(ctx context.Context, source cloudconfig.SourceConfig) ([]model.RemoteFile, error) {
 	if !isRemote(source.Remote) {
-		return errors.New("source is not an rclone remote")
+		return nil, errors.New("source is not an rclone remote")
 	}
-	if !beneath(r.DataDir, destination) {
-		return errors.New("rclone destination is outside the data directory")
+	ctx, err := sourceContext(ctx, source)
+	if err != nil {
+		return nil, err
 	}
-	args := []string{"copy", source.Remote, destination, "--create-empty-src-dirs", "--stats", "0"}
-	args = r.withConfig(args)
-	for _, pattern := range source.Include {
-		args = append(args, "--include", pattern)
+	remote, err := r.open(ctx, source.Remote)
+	if err != nil {
+		return nil, fmt.Errorf("open rclone source: %w", err)
 	}
-	for _, pattern := range source.Exclude {
-		args = append(args, "--exclude", pattern)
+	options := operations.ListJSONOpt{Recurse: true, FilesOnly: true, ShowHash: true}
+	var files []model.RemoteFile
+	size := 0
+	err = operations.ListJSON(ctx, remote, "", &options, func(item *operations.ListJSONItem) error {
+		size += len(item.Path) + len(item.Name) + 128
+		hashes := make(map[string]string, len(item.Hashes))
+		for name, value := range item.Hashes {
+			size += len(name) + len(value)
+			hashes[name] = value
+		}
+		if size > maxInventoryBytes {
+			return errors.New("rclone inventory exceeds 64 MiB")
+		}
+		files = append(files, model.RemoteFile{
+			Path:    item.Path,
+			Size:    item.Size,
+			ModTime: item.ModTime.When,
+			IsDir:   item.IsDir,
+			Hashes:  hashes,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("inventory rclone source: %w", err)
 	}
-	if source.BandwidthLimit != "" {
-		args = append(args, "--bwlimit", source.BandwidthLimit)
-	}
-	if source.Transfers > 0 {
-		args = append(args, "--transfers", strconv.Itoa(source.Transfers))
-	}
-	if source.Checkers > 0 {
-		args = append(args, "--checkers", strconv.Itoa(source.Checkers))
-	}
-	return r.run(ctx, args)
+	return files, nil
 }
 
-func (r Runner) withConfig(args []string) []string {
-	if r.ConfigPath == "" {
-		return args
-	}
-	return append(args, "--config", r.ConfigPath)
-}
-
-func (r Runner) run(ctx context.Context, args []string) error {
-	if err := validateInvocation(r.DataDir, args); err != nil {
+func (r Runner) Download(ctx context.Context, source cloudconfig.SourceConfig, path string, destination io.Writer) error {
+	if _, err := remoteObject(source.Remote, path); err != nil {
 		return err
 	}
-	command := exec.CommandContext(ctx, r.Binary, args...)
-	var output limitedBuffer
-	command.Stdout, command.Stderr = &output, &output
-	if err := command.Run(); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+	ctx, err := sourceContext(ctx, source)
+	if err != nil {
+		return err
+	}
+	remote, err := r.open(ctx, source.Remote)
+	if err != nil {
+		return fmt.Errorf("open rclone source: %w", err)
+	}
+	object, err := remote.NewObject(ctx, path)
+	if err != nil {
+		return fmt.Errorf("open remote object: %w", err)
+	}
+	reader, err := object.Open(ctx)
+	if err != nil {
+		return fmt.Errorf("read remote object: %w", err)
+	}
+	var input io.Reader = reader
+	if source.BandwidthLimit != "" && !strings.EqualFold(source.BandwidthLimit, "off") {
+		limit, err := bandwidthBytes(source.BandwidthLimit)
+		if err != nil {
+			reader.Close()
+			return err
 		}
-		return fmt.Errorf("rclone %s failed: %w", args[0], err)
+		if limit > 0 {
+			input = newLimitedReader(ctx, reader, limit)
+		}
+	}
+	_, copyErr := io.Copy(destination, input)
+	closeErr := reader.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return fmt.Errorf("read remote object: %w", err)
 	}
 	return nil
 }
 
-// validateInvocation is a second safety check at the process boundary. New
-// commands must be classified here before they can execute.
-func validateInvocation(dataDir string, args []string) error {
-	if len(args) == 0 {
-		return errors.New("empty rclone command")
+func (r Runner) configure() error {
+	embeddedConfig.Lock()
+	defer embeddedConfig.Unlock()
+	if embeddedConfig.installed {
+		if embeddedConfig.path != r.ConfigPath {
+			return errors.New("embedded rclone cannot use multiple config paths in one process")
+		}
+		return nil
 	}
-	switch args[0] {
-	case "version":
-		if len(args) != 1 {
-			return errors.New("unsafe rclone version arguments")
+	if r.ConfigPath != "" {
+		if err := rcloneconfig.SetConfigPath(r.ConfigPath); err != nil {
+			return fmt.Errorf("set rclone config path: %w", err)
 		}
-	case "lsf":
-		if len(args) < 2 || !isRemote(args[1]) {
-			return errors.New("rclone lsf requires a remote source")
-		}
-	case "copy":
-		if len(args) < 3 || !isRemote(args[1]) {
-			return errors.New("rclone copy requires a remote source")
-		}
-		if !beneath(dataDir, args[2]) {
-			return errors.New("rclone copy destination is outside the data directory")
-		}
-	default:
-		return fmt.Errorf("rclone command %q is not allowed", args[0])
 	}
+	configfile.Install()
+	embeddedConfig.installed = true
+	embeddedConfig.path = r.ConfigPath
 	return nil
+}
+
+func (r Runner) open(ctx context.Context, name string) (fs.Fs, error) {
+	if err := r.configure(); err != nil {
+		return nil, err
+	}
+	return fs.NewFs(ctx, name)
+}
+
+func sourceContext(ctx context.Context, source cloudconfig.SourceConfig) (context.Context, error) {
+	ctx, settings := fs.AddConfig(ctx)
+	if source.Transfers > 0 {
+		settings.Transfers = source.Transfers
+	}
+	if source.Checkers > 0 {
+		settings.Checkers = source.Checkers
+	}
+	options := filter.Opt
+	options.IncludeRule = append([]string(nil), source.Include...)
+	options.ExcludeRule = append([]string(nil), source.Exclude...)
+	configuredFilter, err := filter.NewFilter(&options)
+	if err != nil {
+		return nil, fmt.Errorf("configure rclone filters: %w", err)
+	}
+	return filter.ReplaceConfig(ctx, configuredFilter), nil
+}
+
+func bandwidthBytes(value string) (int64, error) {
+	value = strings.TrimSuffix(strings.TrimSuffix(value, "/s"), "/S")
+	var parsed fs.SizeSuffix
+	if err := parsed.Set(value); err != nil || parsed < 0 {
+		if err == nil {
+			err = errors.New("rate cannot be negative")
+		}
+		return 0, fmt.Errorf("invalid rclone bandwidth limit: %w", err)
+	}
+	return int64(parsed), nil
+}
+
+type limitedReader struct {
+	ctx     context.Context
+	reader  io.Reader
+	limiter *rate.Limiter
+	burst   int
+}
+
+func newLimitedReader(ctx context.Context, reader io.Reader, bytesPerSecond int64) *limitedReader {
+	burst := int64(128 << 10)
+	if bytesPerSecond < burst {
+		burst = bytesPerSecond
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	return &limitedReader{
+		ctx:     ctx,
+		reader:  reader,
+		limiter: rate.NewLimiter(rate.Limit(bytesPerSecond), int(burst)),
+		burst:   int(burst),
+	}
+}
+
+func (r *limitedReader) Read(buffer []byte) (int, error) {
+	if len(buffer) > r.burst {
+		buffer = buffer[:r.burst]
+	}
+	n, err := r.reader.Read(buffer)
+	if n > 0 {
+		if waitErr := r.limiter.WaitN(r.ctx, n); waitErr != nil {
+			return 0, waitErr
+		}
+	}
+	return n, err
 }
 
 func isRemote(value string) bool {
@@ -113,29 +226,13 @@ func isRemote(value string) bool {
 	return colon > 0 && !strings.ContainsAny(value[:colon], `/\\`) && !strings.ContainsAny(value, "\r\n\x00") && !strings.Contains(value, "://")
 }
 
-func beneath(root, name string) bool {
-	absoluteRoot, err := filepath.Abs(root)
-	if err != nil {
-		return false
+func remoteObject(remote, objectPath string) (string, error) {
+	if !isRemote(remote) || objectPath == "" || strings.HasPrefix(objectPath, "/") || strings.ContainsAny(objectPath, "\\\r\n\x00") {
+		return "", errors.New("invalid remote object path")
 	}
-	absoluteName, err := filepath.Abs(name)
-	if err != nil {
-		return false
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(objectPath)))
+	if clean != objectPath || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", errors.New("invalid remote object path")
 	}
-	relative, err := filepath.Rel(absoluteRoot, absoluteName)
-	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
-}
-
-type limitedBuffer struct{ bytes.Buffer }
-
-func (b *limitedBuffer) Write(value []byte) (int, error) {
-	original := len(value)
-	if b.Len() < 64<<10 {
-		remaining := (64 << 10) - b.Len()
-		if len(value) > remaining {
-			value = value[:remaining]
-		}
-		_, _ = b.Buffer.Write(value)
-	}
-	return original, nil
+	return strings.TrimSuffix(remote, "/") + "/" + objectPath, nil
 }

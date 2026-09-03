@@ -94,8 +94,8 @@ func (source *jmapObjectSource) Collections(ctx context.Context) ([]remoteCollec
 	return []remoteCollection{{Name: collection.Name, RemoteID: collection.RemoteID, URL: collection.URL, Kind: collection.Kind}}, nil
 }
 
-func (source *jmapObjectSource) Objects(ctx context.Context, _ remoteCollection) ([]remoteObject, string, error) {
-	objects, token, err := source.client.Objects(ctx)
+func (source *jmapObjectSource) Objects(ctx context.Context, collection remoteCollection) ([]remoteObject, string, error) {
+	objects, token, err := source.client.Objects(ctx, collection.SyncToken)
 	if err != nil {
 		return nil, "", err
 	}
@@ -255,6 +255,7 @@ func (s *Service) backupObjectCollection(ctx context.Context, account config.Acc
 		entry.Error = err.Error()
 		return
 	}
+	remote.SyncToken = collection.SyncToken
 	objects, token, err := source.Objects(ctx, remote)
 	if err != nil {
 		entry.Error = err.Error()
