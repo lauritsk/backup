@@ -1,7 +1,6 @@
 {
   "data_dir": "/data",
   "rclone": {
-    "binary": "rclone",
     "config_path": "/etc/rclone/rclone.conf"
   },
   "server": {

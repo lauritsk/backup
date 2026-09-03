@@ -4,9 +4,11 @@ package database
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,16 +17,29 @@ import (
 
 	"github.com/lauritsk/backup/internal/appbackup/config"
 	"github.com/lauritsk/backup/internal/atomicfile"
+	_ "modernc.org/sqlite"
 )
 
 type Runner struct{ DataDir string }
 
 func (Runner) Version(ctx context.Context, database config.DatabaseConfig) (string, error) {
+	if database.Type == "sqlite" {
+		db, err := openSQLite(ctx, database.Path)
+		if err != nil {
+			return "", err
+		}
+		defer db.Close()
+		var version string
+		if err := db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&version); err != nil {
+			return "", fmt.Errorf("read embedded SQLite version: %w", err)
+		}
+		return "SQLite " + version + " (modernc.org/sqlite)", nil
+	}
 	output, err := run(ctx, database, database.Binary, []string{"--version"}, nil)
 	if err != nil {
 		return "", err
 	}
-	if database.VerifyCommand == nil && database.RestoreBinary != database.Binary {
+	if database.Type == "postgresql" && database.VerifyCommand == nil && database.RestoreBinary != database.Binary {
 		if _, err := run(ctx, database, database.RestoreBinary, []string{"--version"}, io.Discard); err != nil {
 			return "", err
 		}
@@ -85,12 +100,8 @@ func (Runner) VerifyDump(ctx context.Context, database config.DatabaseConfig, du
 		}
 		return "unknown", nil
 	case "sqlite":
-		output, err := run(ctx, database, database.RestoreBinary, []string{dump, "PRAGMA quick_check;"}, nil)
-		if err != nil {
-			return "passed", err
-		}
-		if strings.TrimSpace(string(output)) != "ok" {
-			return "passed", errors.New("SQLite quick_check did not return ok")
+		if err := sqliteQuickCheck(ctx, dump); err != nil {
+			return "failed", err
 		}
 		return "passed", nil
 	case "mysql", "mariadb":
@@ -101,7 +112,7 @@ func (Runner) VerifyDump(ctx context.Context, database config.DatabaseConfig, du
 }
 
 func (Runner) Check(ctx context.Context, database config.DatabaseConfig) error {
-	if database.VerifyCommand == nil && (database.Type == "postgresql" || database.Type == "sqlite") {
+	if database.VerifyCommand == nil && database.Type == "postgresql" {
 		if _, err := run(ctx, database, database.RestoreBinary, []string{"--version"}, io.Discard); err != nil {
 			return err
 		}
@@ -114,11 +125,7 @@ func (Runner) Check(ctx context.Context, database config.DatabaseConfig) error {
 		_, err := run(ctx, database, database.Binary, append(mysqlArgs(database), "--no-data", database.Name), io.Discard)
 		return err
 	case "sqlite":
-		output, err := run(ctx, database, database.Binary, []string{database.Path, "PRAGMA quick_check;"}, nil)
-		if err == nil && strings.TrimSpace(string(output)) != "ok" {
-			return errors.New("SQLite quick_check did not return ok")
-		}
-		return err
+		return sqliteQuickCheck(ctx, database.Path)
 	default:
 		return fmt.Errorf("unsupported database type %q", database.Type)
 	}
@@ -161,12 +168,23 @@ func sqliteBackup(ctx context.Context, database config.DatabaseConfig, destinati
 		os.Remove(temporary)
 		return err
 	}
-	defer os.Remove(temporary)
-	if err := os.Chmod(temporary, 0o600); err != nil {
+	if err := os.Remove(temporary); err != nil {
 		return err
 	}
-	quoted := strings.ReplaceAll(temporary, "'", "''")
-	if _, err := run(ctx, database, database.Binary, []string{database.Path, ".backup '" + quoted + "'"}, io.Discard); err != nil {
+	defer os.Remove(temporary)
+
+	db, err := openSQLite(ctx, database.Path)
+	if err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, `VACUUM INTO ?`, temporary); err != nil {
+		db.Close()
+		return fmt.Errorf("create SQLite snapshot: %w", err)
+	}
+	if err := db.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(temporary, 0o600); err != nil {
 		return err
 	}
 	file, err = os.OpenFile(temporary, os.O_RDWR, 0)
@@ -188,6 +206,40 @@ func sqliteBackup(ctx context.Context, database config.DatabaseConfig, destinati
 		return err
 	}
 	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func openSQLite(ctx context.Context, path string) (*sql.DB, error) {
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open SQLite database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open SQLite database: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure SQLite database: %w", err)
+	}
+	return db, nil
+}
+
+func sqliteQuickCheck(ctx context.Context, path string) error {
+	db, err := openSQLite(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var result string
+	if err := db.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&result); err != nil {
+		return fmt.Errorf("run SQLite quick_check: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("SQLite quick_check: %s", result)
+	}
+	return nil
 }
 
 func run(ctx context.Context, database config.DatabaseConfig, binary string, args []string, stdout io.Writer) ([]byte, error) {

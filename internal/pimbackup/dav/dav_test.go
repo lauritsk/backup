@@ -96,6 +96,34 @@ func TestCardDAVDiscoveryAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSyncCollectionUsesAndAdvancesToken(t *testing.T) {
+	var requestBody string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
+		requestBody = string(body)
+		if request.Method != "REPORT" {
+			http.Error(writer, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/xml")
+		writer.WriteHeader(http.StatusMultiStatus)
+		_, _ = io.WriteString(writer, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/changed.vcf</d:href><d:propstat><d:prop><d:getetag>"two"</d:getetag><d:getcontenttype>text/vcard</d:getcontenttype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/deleted.vcf</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response><d:sync-token>token-2</d:sync-token></d:multistatus>`)
+	}))
+	defer server.Close()
+	client, err := New(context.Background(), config.AccountConfig{Protocol: "carddav", URL: server.URL + "/dav/", Timeout: config.Duration{Duration: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	objects, token, err := client.Objects(context.Background(), Collection{RemoteID: "/dav/", URL: server.URL + "/dav/", SyncToken: "token-1"})
+	if err != nil || token != "token-2" || len(objects) != 1 || objects[0].RemoteID != "/dav/changed.vcf" || objects[0].ETag != "two" {
+		t.Fatalf("Objects() = %#v, %q, %v", objects, token, err)
+	}
+	if !strings.Contains(requestBody, "<d:sync-token>token-1</d:sync-token>") {
+		t.Fatalf("sync request did not contain prior token: %s", requestBody)
+	}
+}
+
 func TestCalDAVDiscoveryAndRestore(t *testing.T) {
 	const event = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:one\r\nSUMMARY:Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

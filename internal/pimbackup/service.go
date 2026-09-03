@@ -9,8 +9,8 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"time"
 
+	"github.com/lauritsk/backup/internal/operationexecutor"
 	"github.com/lauritsk/backup/internal/operationlock"
 	"github.com/lauritsk/backup/internal/pimbackup/catalog"
 	"github.com/lauritsk/backup/internal/pimbackup/config"
@@ -19,7 +19,6 @@ import (
 	"github.com/lauritsk/backup/internal/pimbackup/model"
 	"github.com/lauritsk/backup/internal/pimbackup/objectstore"
 	runmodel "github.com/lauritsk/backup/internal/run"
-	"github.com/lauritsk/backup/internal/safeerror"
 )
 
 var ErrOperationBusy = errors.New("another backup, verification, restore, or rebuild is already running")
@@ -34,7 +33,7 @@ type Service struct {
 	logger          *slog.Logger
 	ctx             context.Context
 	cancel          context.CancelFunc
-	async           sync.WaitGroup
+	operations      *operationexecutor.Executor[catalog.Run]
 	initializeMutex sync.Mutex
 	initialized     atomic.Bool
 }
@@ -67,6 +66,7 @@ func OpenService(ctx context.Context, cfg config.Config, options ServiceOptions)
 	}
 	gate, err := operationlock.New(cfg.DataDir, ".pimbackup.lock", ErrOperationBusy)
 	if err != nil {
+		_ = objectStore.Close()
 		catalogStore.Close()
 		return nil, err
 	}
@@ -75,6 +75,9 @@ func OpenService(ctx context.Context, cfg config.Config, options ServiceOptions)
 		config: cfg, catalog: catalogStore, store: fileStore, objectStore: objectStore,
 		dialer: options.Dialer, gate: gate, logger: options.Logger, ctx: serviceContext, cancel: cancel,
 	}
+	service.operations = operationexecutor.New(serviceContext, catalogStore, gate.TryAcquire, service.ensureInitialized, func(record catalog.Run) (string, runmodel.Operation) {
+		return record.ID, record.Operation
+	}, options.Logger)
 	release, lockErr := service.gate.TryAcquire()
 	if errors.Is(lockErr, ErrOperationBusy) {
 		service.logger.Warn("startup reconciliation skipped because another process holds the operation lock")
@@ -129,141 +132,41 @@ func (s *Service) initialize(ctx context.Context) error {
 
 func (s *Service) Close() error {
 	s.cancel()
-	s.async.Wait()
-	return errors.Join(s.gate.Close(), s.catalog.Close())
+	s.operations.Wait()
+	return errors.Join(s.objectStore.Close(), s.gate.Close(), s.catalog.Close())
 }
 
 func (s *Service) Config() config.Config { return s.config }
 
-type executionMode int
-
-const (
-	executeNow executionMode = iota
-	executeQueued
-)
-
-func (s *Service) submit(ctx context.Context, operation runmodel.Operation, request any, action operationAction, mode executionMode) (catalog.Run, error) {
-	prepared, err := s.prepareOperation(ctx, operation, request, action)
-	if err != nil {
-		return catalog.Run{}, err
+func (s *Service) submit(ctx context.Context, operation runmodel.Operation, request any, action operationexecutor.Action, queued bool) (catalog.Run, error) {
+	if queued {
+		return s.operations.Queue(ctx, operation, request, action)
 	}
-	if mode == executeQueued {
-		prepared.queue(s.ctx, s.logger)
-		return prepared.run, nil
-	}
-	return prepared.execute(ctx)
+	return s.operations.Run(ctx, operation, request, action)
 }
 
 func (s *Service) Backup(ctx context.Context, request model.BackupRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationBackup, request, func(runContext context.Context) (any, error) { return s.backup(runContext, request) }, executeNow)
+	return s.submit(ctx, runmodel.OperationBackup, request, func(runContext context.Context, _ string) (any, error) { return s.backup(runContext, request) }, false)
 }
 
 func (s *Service) QueueBackup(ctx context.Context, request model.BackupRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationBackup, request, func(runContext context.Context) (any, error) { return s.backup(runContext, request) }, executeQueued)
+	return s.submit(ctx, runmodel.OperationBackup, request, func(runContext context.Context, _ string) (any, error) { return s.backup(runContext, request) }, true)
 }
 
 func (s *Service) Verify(ctx context.Context, request model.VerifyRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationVerify, request, func(runContext context.Context) (any, error) { return s.verify(runContext, request) }, executeNow)
+	return s.submit(ctx, runmodel.OperationVerify, request, func(runContext context.Context, _ string) (any, error) { return s.verify(runContext, request) }, false)
 }
 
 func (s *Service) QueueVerify(ctx context.Context, request model.VerifyRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationVerify, request, func(runContext context.Context) (any, error) { return s.verify(runContext, request) }, executeQueued)
+	return s.submit(ctx, runmodel.OperationVerify, request, func(runContext context.Context, _ string) (any, error) { return s.verify(runContext, request) }, true)
 }
 
 func (s *Service) Restore(ctx context.Context, request model.RestoreRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationRestore, request, func(runContext context.Context) (any, error) { return s.restore(runContext, request) }, executeNow)
+	return s.submit(ctx, runmodel.OperationRestore, request, func(runContext context.Context, _ string) (any, error) { return s.restore(runContext, request) }, false)
 }
 
 func (s *Service) QueueRestore(ctx context.Context, request model.RestoreRequest) (catalog.Run, error) {
-	return s.submit(ctx, runmodel.OperationRestore, request, func(runContext context.Context) (any, error) { return s.restore(runContext, request) }, executeQueued)
-}
-
-type operationAction func(context.Context) (any, error)
-
-type preparedOperation struct {
-	service *Service
-	run     catalog.Run
-	release func() error
-	action  operationAction
-}
-
-func (s *Service) prepareOperation(ctx context.Context, operation runmodel.Operation, request any, action operationAction) (*preparedOperation, error) {
-	release, err := s.gate.TryAcquire()
-	if err != nil {
-		return nil, err
-	}
-	if err := s.ensureInitialized(ctx); err != nil {
-		_ = release()
-		return nil, err
-	}
-	run, err := s.catalog.CreateRun(ctx, operation, request)
-	if err != nil {
-		_ = release()
-		return nil, err
-	}
-	return &preparedOperation{service: s, run: run, release: release, action: action}, nil
-}
-
-func (p *preparedOperation) queue(ctx context.Context, logger *slog.Logger) {
-	p.service.async.Add(1)
-	go func() {
-		defer p.service.async.Done()
-		run, err := p.execute(ctx)
-		if err != nil {
-			logger.Error("asynchronous operation failed", "run_id", run.ID, "operation", run.Operation, "error", err)
-		} else {
-			logger.Info("asynchronous operation finished", "run_id", run.ID, "operation", run.Operation, "status", run.Status)
-		}
-	}()
-}
-
-func (p *preparedOperation) execute(ctx context.Context) (result catalog.Run, resultErr error) {
-	defer func() {
-		if err := p.release(); err != nil && resultErr == nil {
-			resultErr = fmt.Errorf("release operation lock: %w", err)
-		}
-	}()
-
-	startContext, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	startErr := p.service.catalog.StartRun(startContext, p.run.ID)
-	startCancel()
-	if startErr != nil {
-		return p.run, startErr
-	}
-	p.service.logger.Info("operation started", "run_id", p.run.ID, "operation", p.run.Operation)
-	detail, operationErr := invokeOperation(ctx, p.action)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		operationErr = errors.Join(ctxErr, operationErr)
-	}
-	status := runmodel.StatusSucceeded
-	if operationErr != nil {
-		if errors.Is(operationErr, context.Canceled) || errors.Is(operationErr, context.DeadlineExceeded) {
-			status = runmodel.StatusCanceled
-		} else {
-			status = runmodel.StatusFailed
-		}
-	}
-
-	finishContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := p.service.catalog.FinishRun(finishContext, p.run.ID, status, safeerror.Clean(operationErr), detail); err != nil {
-		return p.run, errors.Join(operationErr, err)
-	}
-	finished, err := p.service.catalog.GetRun(finishContext, p.run.ID)
-	if err != nil {
-		return p.run, errors.Join(operationErr, err)
-	}
-	p.service.logger.Info("operation finished", "run_id", finished.ID, "operation", finished.Operation, "status", finished.Status)
-	return finished, operationErr
-}
-
-func invokeOperation(ctx context.Context, action operationAction) (detail any, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("operation panic: %v", recovered)
-		}
-	}()
-	return action(ctx)
+	return s.submit(ctx, runmodel.OperationRestore, request, func(runContext context.Context, _ string) (any, error) { return s.restore(runContext, request) }, true)
 }
 
 func (s *Service) Ready(ctx context.Context) error {

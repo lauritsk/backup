@@ -44,8 +44,8 @@ func (cfg Config) Validate() error {
 		problems = append(problems, "log.format must be json or text")
 	}
 	if cfg.Engine != nil {
-		if !oneOf(cfg.Engine.Type, "docker", "podman") || invalidText(cfg.Engine.Binary) || !filepath.IsAbs(cfg.Engine.Socket) || filepath.Clean(cfg.Engine.Socket) != cfg.Engine.Socket || strings.ContainsAny(cfg.Engine.Socket, "\r\n\x00") {
-			problems = append(problems, "engine requires type docker or podman, a binary, and an absolute socket path")
+		if !oneOf(cfg.Engine.Type, "docker", "podman") || !filepath.IsAbs(cfg.Engine.Socket) || filepath.Clean(cfg.Engine.Socket) != cfg.Engine.Socket || strings.ContainsAny(cfg.Engine.Socket, "\r\n\x00") {
+			problems = append(problems, "engine requires type docker or podman and a clean absolute socket path")
 		}
 	}
 	if len(cfg.Applications) > 1000 {
@@ -161,8 +161,22 @@ func validateDatabase(database DatabaseConfig) error {
 	if !oneOf(database.Type, "postgresql", "mysql", "mariadb", "sqlite") {
 		problems = append(problems, "type must be postgresql, mysql, mariadb, or sqlite")
 	}
-	if invalidText(database.Binary) || invalidText(database.RestoreBinary) {
-		problems = append(problems, "binary and restore_binary are required")
+	switch database.Type {
+	case "postgresql":
+		if invalidText(database.Binary) || invalidText(database.RestoreBinary) {
+			problems = append(problems, "binary and restore_binary are required")
+		}
+	case "mysql", "mariadb":
+		if invalidText(database.Binary) {
+			problems = append(problems, "binary is required")
+		}
+		if database.RestoreBinary != "" {
+			problems = append(problems, "restore_binary is not used for mysql or mariadb")
+		}
+	case "sqlite":
+		if database.Binary != "" || database.RestoreBinary != "" {
+			problems = append(problems, "sqlite does not use binary or restore_binary")
+		}
 	}
 	if database.Timeout.Duration <= 0 {
 		problems = append(problems, "timeout must be greater than zero")

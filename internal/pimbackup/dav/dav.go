@@ -2,8 +2,10 @@
 package dav
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -201,6 +203,13 @@ func (c *Client) Collections(ctx context.Context) ([]Collection, error) {
 }
 
 func (c *Client) Objects(ctx context.Context, collection Collection) ([]Object, string, error) {
+	objects, token, supported, err := c.syncCollection(ctx, collection)
+	if err != nil {
+		return nil, "", err
+	}
+	if supported {
+		return objects, token, nil
+	}
 	entries, err := c.webdav.ReadDir(ctx, collection.RemoteID, false)
 	if err != nil {
 		return nil, "", err
@@ -213,6 +222,88 @@ func (c *Client) Objects(ctx context.Context, collection Collection) ([]Object, 
 		result = append(result, Object{RemoteID: entry.Path, URL: c.resolve(entry.Path), ETag: entry.ETag, ContentType: entry.MIMEType})
 	}
 	return result, "", nil
+}
+
+// syncCollection uses RFC 6578 directly for both CardDAV and CalDAV. The
+// go-webdav release used here exposes this operation only through CardDAV.
+func (c *Client) syncCollection(ctx context.Context, collection Collection) ([]Object, string, bool, error) {
+	body := `<?xml version="1.0" encoding="utf-8"?><d:sync-collection xmlns:d="DAV:"><d:sync-token>` +
+		xmlEscape(collection.SyncToken) + `</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/><d:getcontenttype/></d:prop></d:sync-collection>`
+	request, err := http.NewRequestWithContext(ctx, "REPORT", collection.URL, bytes.NewBufferString(body))
+	if err != nil {
+		return nil, "", false, err
+	}
+	request.Header.Set("Content-Type", "application/xml; charset=utf-8")
+	request.Header.Set("Depth", "1")
+	setAuth(request, c.account)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, "", false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusMultiStatus {
+		// Unsupported reports and expired tokens both require a full inventory.
+		// Do not advance the token on that fallback.
+		if response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed || response.StatusCode == http.StatusNotImplemented {
+			return nil, "", false, nil
+		}
+		return nil, "", false, fmt.Errorf("DAV sync-collection returned HTTP %d", response.StatusCode)
+	}
+	var document davMultiStatus
+	decoder := xml.NewDecoder(io.LimitReader(response.Body, 32<<20))
+	if err := decoder.Decode(&document); err != nil {
+		return nil, "", false, fmt.Errorf("decode DAV sync-collection: %w", err)
+	}
+	if document.SyncToken == "" {
+		return nil, "", false, errors.New("DAV sync-collection returned no sync token")
+	}
+	objects := make([]Object, 0, len(document.Responses))
+	for _, item := range document.Responses {
+		remoteID := davPath(item.Href)
+		if remoteID == "" || samePath(remoteID, davPath(collection.RemoteID)) || strings.Contains(item.Status, " 404 ") {
+			continue
+		}
+		for _, propstat := range item.PropStats {
+			if !strings.Contains(propstat.Status, " 200 ") {
+				continue
+			}
+			objects = append(objects, Object{RemoteID: remoteID, URL: c.resolve(item.Href), ETag: strings.Trim(propstat.Prop.ETag, `"`), ContentType: propstat.Prop.ContentType})
+			break
+		}
+	}
+	return objects, document.SyncToken, true, nil
+}
+
+type davMultiStatus struct {
+	SyncToken string        `xml:"sync-token"`
+	Responses []davResponse `xml:"response"`
+}
+type davResponse struct {
+	Href      string        `xml:"href"`
+	Status    string        `xml:"status"`
+	PropStats []davPropStat `xml:"propstat"`
+}
+type davPropStat struct {
+	Status string  `xml:"status"`
+	Prop   davProp `xml:"prop"`
+}
+type davProp struct {
+	ETag        string `xml:"getetag"`
+	ContentType string `xml:"getcontenttype"`
+}
+
+func davPath(value string) string {
+	parsed, err := url.Parse(value)
+	if err == nil && parsed.Path != "" {
+		return parsed.Path
+	}
+	return value
+}
+
+func xmlEscape(value string) string {
+	var output strings.Builder
+	_ = xml.EscapeText(&output, []byte(value))
+	return output.String()
 }
 
 func (c *Client) Get(ctx context.Context, object Object) (io.ReadCloser, string, error) {

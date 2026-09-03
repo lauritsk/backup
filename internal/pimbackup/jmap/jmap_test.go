@@ -74,6 +74,8 @@ func TestMailBackupAndImport(t *testing.T) {
 				result = map[string]any{"accountId": "a1", "queryState": "q1", "position": 0, "ids": []string{"e1"}, "total": total}
 			case "Email/get":
 				result = map[string]any{"accountId": "a1", "state": "e-state", "list": []any{map[string]any{"id": "e1", "blobId": "b1", "subject": "Test", "receivedAt": "2024-01-02T03:04:05Z", "keywords": map[string]bool{"$seen": true}, "mailboxIds": map[string]bool{"inbox": true}}}, "notFound": []string{}}
+			case "Email/changes":
+				result = map[string]any{"accountId": "a1", "oldState": "e-state", "newState": "e-state-2", "hasMoreChanges": false, "created": []string{}, "updated": []string{}, "destroyed": []string{}}
 			case "Email/import":
 				result = map[string]any{"accountId": "a1", "created": map[string]any{}}
 				var arguments map[string]any
@@ -112,9 +114,13 @@ func TestMailBackupAndImport(t *testing.T) {
 	if err != nil || collection.RemoteID != "a1" {
 		t.Fatalf("Collection() = %#v, %v", collection, err)
 	}
-	objects, state, err := client.Objects(context.Background())
-	if err != nil || len(objects) != 1 || state != "q1" || len(objects[0].Flags) != 1 || objects[0].Flags[0] != "$seen" || len(objects[0].MailboxIDs) != 1 || objects[0].ReceivedAt == nil {
+	objects, state, err := client.Objects(context.Background(), "")
+	if err != nil || len(objects) != 1 || state != "e-state" || len(objects[0].Flags) != 1 || objects[0].Flags[0] != "$seen" || len(objects[0].MailboxIDs) != 1 || objects[0].ReceivedAt == nil {
 		t.Fatalf("Objects() = %#v, %q, %v", objects, state, err)
+	}
+	changes, state, err := client.Objects(context.Background(), state)
+	if err != nil || len(changes) != 0 || state != "e-state-2" {
+		t.Fatalf("incremental Objects() = %#v, %q, %v", changes, state, err)
 	}
 	body, err := client.Get(context.Background(), objects[0])
 	if err != nil {

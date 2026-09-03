@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,47 +23,62 @@ import (
 
 var safeID = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 
-type fileStore struct{ dataDir string }
+type fileStore struct {
+	dataDir string
+	root    *os.Root
+}
 
 func newFileStore(dataDir string) (*fileStore, error) {
-	store := &fileStore{dataDir: dataDir}
-	for _, path := range []string{store.recoveryRoot(), filepath.Join(dataDir, "staging"), filepath.Join(dataDir, "restores"), filepath.Join(dataDir, "restic")} {
-		if err := secureDirectory(dataDir, path); err != nil {
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	store := &fileStore{dataDir: dataDir, root: root}
+	for _, name := range []string{"recovery-points", "staging", "restores", "restic"} {
+		if err := store.secureDirectory(name); err != nil {
+			root.Close()
 			return nil, err
 		}
 	}
 	return store, nil
 }
-func secureDirectory(root, path string) error {
-	relative, err := filepath.Rel(root, path)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+func (s *fileStore) Close() error { return s.root.Close() }
+func (s *fileStore) secureDirectory(name string) error {
+	if !fs.ValidPath(name) {
 		return errors.New("directory escapes the data root")
 	}
-	current := root
-	parts := []string{}
-	if relative != "." {
-		parts = strings.Split(relative, string(filepath.Separator))
-	}
-	for _, part := range parts {
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
+	current := ""
+	for _, part := range strings.Split(name, "/") {
+		current = pathpkg.Join(current, part)
+		info, err := s.root.Lstat(current)
 		if errors.Is(err, os.ErrNotExist) {
-			if err := os.Mkdir(current, 0o700); err != nil {
+			if err := s.root.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 				return err
 			}
-			info, err = os.Lstat(current)
+			info, err = s.root.Lstat(current)
 		}
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s is not a plain directory", current)
+		if !info.Mode().IsDir() {
+			return fmt.Errorf("%s is not a plain directory", filepath.Join(s.dataDir, filepath.FromSlash(current)))
 		}
-		if err := os.Chmod(current, 0o700); err != nil {
+		if err := s.root.Chmod(current, 0o700); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+func (s *fileStore) relative(absolute string) (string, error) {
+	relative, err := filepath.Rel(s.dataDir, absolute)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("path escapes the data root")
+	}
+	result := filepath.ToSlash(relative)
+	if !fs.ValidPath(result) {
+		return "", errors.New("invalid data path")
+	}
+	return result, nil
 }
 func (s *fileStore) recoveryRoot() string { return filepath.Join(s.dataDir, "recovery-points") }
 func (s *fileStore) pointDir(id string) (string, error) {
@@ -81,18 +98,30 @@ func (s *fileStore) stagingDir(id, app string) (string, error) {
 	if !safeID.MatchString(id) || !safeID.MatchString(app) {
 		return "", errors.New("invalid staging ID")
 	}
-	path := filepath.Join(s.dataDir, "staging", id, app)
-	return path, secureDirectory(s.dataDir, path)
+	absolute := filepath.Join(s.dataDir, "staging", id, app)
+	relative, err := s.relative(absolute)
+	if err != nil {
+		return "", err
+	}
+	return absolute, s.secureDirectory(relative)
 }
 func (s *fileStore) prepareDumpDir(staging string) error {
-	return secureDirectory(s.dataDir, filepath.Join(staging, "dumps"))
+	relative, err := s.relative(filepath.Join(staging, "dumps"))
+	if err != nil {
+		return err
+	}
+	return s.secureDirectory(relative)
 }
 func (s *fileStore) restoreDir(runID, pointID string) (string, error) {
 	if !safeID.MatchString(runID) || !safeID.MatchString(pointID) {
 		return "", errors.New("invalid recovery point ID")
 	}
-	path := filepath.Join(s.dataDir, "restores", runID, pointID)
-	return path, secureDirectory(s.dataDir, path)
+	absolute := filepath.Join(s.dataDir, "restores", runID, pointID)
+	relative, err := s.relative(absolute)
+	if err != nil {
+		return "", err
+	}
+	return absolute, s.secureDirectory(relative)
 }
 
 func (s *fileStore) writeRecoveryPoint(point model.RecoveryPoint) (string, error) {
@@ -103,10 +132,14 @@ func (s *fileStore) writeRecoveryPoint(point model.RecoveryPoint) (string, error
 	if err != nil {
 		return "", err
 	}
-	if err := secureDirectory(s.dataDir, filepath.Dir(path)); err != nil {
+	relative, err := s.relative(path)
+	if err != nil {
 		return "", err
 	}
-	err = atomicfile.Write(path, 0o600, func(writer io.Writer) error {
+	if err := s.secureDirectory(pathpkg.Dir(relative)); err != nil {
+		return "", err
+	}
+	err = atomicfile.WriteRoot(s.root, relative, 0o600, func(writer io.Writer) error {
 		encoder := json.NewEncoder(writer)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(point)
@@ -118,17 +151,17 @@ func (s *fileStore) readRecoveryPoint(id string) (model.RecoveryPoint, error) {
 	if err != nil {
 		return model.RecoveryPoint{}, err
 	}
-	point, err := readRecoveryPointFile(path, id)
+	point, err := s.readRecoveryPointFile(path, id)
 	if err != nil {
 		return point, err
 	}
 	return point, s.validateRecoveryPoint(point)
 }
 func (s *fileStore) readRecoveryPoints(ctx context.Context) ([]model.RecoveryPoint, error) {
-	if err := secureDirectory(s.dataDir, s.recoveryRoot()); err != nil {
+	if err := s.secureDirectory("recovery-points"); err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(s.recoveryRoot())
+	entries, err := fs.ReadDir(s.root.FS(), "recovery-points")
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +173,7 @@ func (s *fileStore) readRecoveryPoints(ctx context.Context) ([]model.RecoveryPoi
 		if !entry.IsDir() || !safeID.MatchString(entry.Name()) {
 			continue
 		}
-		point, err := readRecoveryPointFile(filepath.Join(s.recoveryRoot(), entry.Name(), "manifest.json"), entry.Name())
+		point, err := s.readRecoveryPointFile(filepath.Join(s.recoveryRoot(), entry.Name(), "manifest.json"), entry.Name())
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -155,9 +188,21 @@ func (s *fileStore) readRecoveryPoints(ctx context.Context) ([]model.RecoveryPoi
 	sort.Slice(result, func(i, j int) bool { return result[i].StartedAt.Before(result[j].StartedAt) })
 	return result, nil
 }
-func readRecoveryPointFile(path, id string) (model.RecoveryPoint, error) {
-	file, err := openRegular(path)
+func (s *fileStore) readRecoveryPointFile(filename, id string) (model.RecoveryPoint, error) {
+	relative, err := s.relative(filename)
 	if err != nil {
+		return model.RecoveryPoint{}, err
+	}
+	file, err := s.root.Open(relative)
+	if err != nil {
+		return model.RecoveryPoint{}, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		if err == nil {
+			err = errors.New("stored metadata path is not a regular file")
+		}
 		return model.RecoveryPoint{}, err
 	}
 	var point model.RecoveryPoint
@@ -171,13 +216,13 @@ func readRecoveryPointFile(path, id string) (model.RecoveryPoint, error) {
 	}
 	closeErr := file.Close()
 	if decodeErr != nil {
-		return point, fmt.Errorf("decode recovery point %s: %w", path, decodeErr)
+		return point, fmt.Errorf("decode recovery point %s: %w", filename, decodeErr)
 	}
 	if closeErr != nil {
 		return point, closeErr
 	}
 	if point.SchemaVersion != 1 || point.ID != id || !safeID.MatchString(point.ApplicationID) {
-		return point, fmt.Errorf("invalid recovery point manifest %s", path)
+		return point, fmt.Errorf("invalid recovery point manifest %s", filename)
 	}
 	return point, nil
 }
@@ -208,34 +253,22 @@ func (s *fileStore) validateRecoveryPoint(point model.RecoveryPoint) error {
 	}
 	return nil
 }
-func openRegular(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("stored metadata path is not a regular file")
-	}
-	return os.Open(path)
-}
-
 func (s *fileStore) removeStaging(id string) error {
 	if !safeID.MatchString(id) {
 		return errors.New("invalid staging ID")
 	}
-	return os.RemoveAll(filepath.Join(s.dataDir, "staging", id))
+	return s.root.RemoveAll(pathpkg.Join("staging", id))
 }
 func (s *fileStore) cleanStaging() error {
-	root := filepath.Join(s.dataDir, "staging")
-	if err := secureDirectory(s.dataDir, root); err != nil {
+	if err := s.secureDirectory("staging"); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(root)
+	entries, err := fs.ReadDir(s.root.FS(), "staging")
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+		if err := s.root.RemoveAll(pathpkg.Join("staging", entry.Name())); err != nil {
 			return err
 		}
 	}

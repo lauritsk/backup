@@ -54,7 +54,6 @@ type LogConfig struct {
 
 type EngineConfig struct {
 	Type   string `json:"type"`
-	Binary string `json:"binary"`
 	Socket string `json:"socket"`
 }
 

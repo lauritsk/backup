@@ -29,6 +29,7 @@ const format = "pimbackup-object-v1"
 type Store struct {
 	dataDir     string
 	accountsDir string
+	root        *os.Root
 }
 
 type CollectionMetadata struct {
@@ -85,24 +86,41 @@ func New(dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve data directory: %w", err)
 	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("inspect data directory: %w", err)
+	}
+	if !info.Mode().IsDir() {
+		return nil, errors.New("object store data path is not a plain directory")
+	}
 	accounts := filepath.Join(absolute, "accounts")
-	if err := os.MkdirAll(accounts, 0o700); err != nil {
+	if err := ensurePrivateDirectories(absolute, accounts); err != nil {
 		return nil, fmt.Errorf("create accounts directory: %w", err)
 	}
-	return &Store{dataDir: absolute, accountsDir: accounts}, nil
+	root, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("open object store root: %w", err)
+	}
+	return &Store{dataDir: absolute, accountsDir: accounts, root: root}, nil
 }
+
+func (s *Store) Close() error { return s.root.Close() }
 
 func (s *Store) PrepareCollection(collection model.Collection) (string, error) {
 	dir, err := s.collectionDir(collection.AccountID, collection.Kind, collection.RemoteID)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDirectories(s.dataDir, dir); err != nil {
 		return "", fmt.Errorf("create collection directory: %w", err)
 	}
 	metadata := CollectionMetadata{Format: format, AccountID: collection.AccountID, Kind: collection.Kind,
 		Name: collection.Name, RemoteID: collection.RemoteID, RemoteURL: collection.RemoteURL, SyncToken: collection.SyncToken}
-	if err := writeJSON(filepath.Join(dir, "collection.json"), metadata); err != nil {
+	metadataPath, err := s.relative(filepath.Join(dir, "collection.json"))
+	if err != nil {
+		return "", err
+	}
+	if err := s.writeJSON(metadataPath, metadata); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -127,40 +145,17 @@ func (s *Store) Save(ctx context.Context, collection model.Collection, remoteID,
 	payloadPath := filepath.Join(dir, name)
 	sidecarPath := strings.TrimSuffix(payloadPath, ext) + ".json"
 
-	temp, err := os.CreateTemp(dir, ".object.tmp-")
+	relPayload, err := s.relative(payloadPath)
 	if err != nil {
-		return Saved{}, fmt.Errorf("create object temporary file: %w", err)
-	}
-	tempPath := temp.Name()
-	committed := false
-	defer func() {
-		_ = temp.Close()
-		if !committed {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
 		return Saved{}, err
 	}
-	hash := sha256.New()
-	written, err := copyContext(ctx, io.MultiWriter(temp, hash), body)
+	relSidecar, err := s.relative(sidecarPath)
 	if err != nil {
-		return Saved{}, fmt.Errorf("write object: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		return Saved{}, fmt.Errorf("sync object: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return Saved{}, fmt.Errorf("close object: %w", err)
-	}
-	if _, err := verifyFile(tempPath, collection.Kind); err != nil {
 		return Saved{}, err
 	}
-	digest := hex.EncodeToString(hash.Sum(nil))
-
 	created := true
 	archivedAt := time.Now().UTC()
-	if current, metadataErr := readMetadata(sidecarPath); metadataErr == nil {
+	if current, metadataErr := s.readMetadata(relSidecar); metadataErr == nil {
 		if current.RemoteID != remoteID || current.AccountID != collection.AccountID || current.Kind != collection.Kind || current.CollectionID != collection.RemoteID {
 			return Saved{}, errors.New("existing object metadata has a conflicting identity")
 		}
@@ -170,27 +165,33 @@ func (s *Store) Save(ctx context.Context, collection model.Collection, remoteID,
 		// A fresh, validated remote copy can repair a damaged sidecar.
 		created = false
 	}
-	if err := os.Rename(tempPath, payloadPath); err != nil {
-		return Saved{}, fmt.Errorf("commit object: %w", err)
-	}
-	committed = true
-	if err := atomicfile.SyncDir(dir); err != nil {
+	var written int64
+	var digest, title string
+	err = atomicfile.WriteRoot(s.root, relPayload, 0o600, func(writer io.Writer) error {
+		hash := sha256.New()
+		var writeErr error
+		written, writeErr = copyContext(ctx, io.MultiWriter(writer, hash), body)
+		if writeErr != nil {
+			return fmt.Errorf("write object: %w", writeErr)
+		}
+		digest = hex.EncodeToString(hash.Sum(nil))
+		seeker, ok := writer.(io.ReadSeeker)
+		if !ok {
+			return errors.New("object temporary file is not seekable")
+		}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		title, err = verifyReader(seeker, collection.Kind)
+		return err
+	})
+	if err != nil {
 		return Saved{}, err
 	}
-
-	title, _ := verifyFile(payloadPath, collection.Kind)
 	metadata := Metadata{Format: format, AccountID: collection.AccountID, Kind: collection.Kind,
 		Collection: collection.Name, CollectionID: collection.RemoteID, RemoteID: remoteID, ETag: etag, ContentType: contentType,
 		Size: written, SHA256: digest, Title: title, Flags: append([]string(nil), attributes.Flags...), InternalDate: copyTime(attributes.InternalDate), RemoteCollections: append([]string(nil), attributes.RemoteCollections...), ArchivedAt: archivedAt}
-	if err := writeJSON(sidecarPath, metadata); err != nil {
-		return Saved{}, err
-	}
-	relPayload, err := s.relative(payloadPath)
-	if err != nil {
-		return Saved{}, err
-	}
-	relSidecar, err := s.relative(sidecarPath)
-	if err != nil {
+	if err := s.writeJSON(relSidecar, metadata); err != nil {
 		return Saved{}, err
 	}
 	return Saved{Created: created, Object: model.Object{CollectionID: collection.ID, AccountID: collection.AccountID,
@@ -200,18 +201,23 @@ func (s *Store) Save(ctx context.Context, collection model.Collection, remoteID,
 }
 
 func (s *Store) Open(object model.Object) (*os.File, error) {
-	path, err := s.Resolve(object.Path)
+	if _, err := s.Resolve(object.Path); err != nil {
+		return nil, err
+	}
+	file, err := s.root.Open(filepath.ToSlash(object.Path))
 	if err != nil {
 		return nil, err
 	}
-	info, err := os.Lstat(path)
+	info, err := file.Stat()
 	if err != nil {
+		file.Close()
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
+		file.Close()
 		return nil, errors.New("object payload is not a regular file")
 	}
-	return os.Open(path)
+	return file, nil
 }
 
 func (s *Store) BasicCheck(object model.Object) error {
@@ -223,7 +229,7 @@ func (s *Store) BasicCheck(object model.Object) error {
 	if err != nil {
 		return err
 	}
-	metadata, err := readMetadata(sidecar)
+	metadata, err := s.readMetadata(object.SidecarPath)
 	if err != nil {
 		return fmt.Errorf("read object sidecar: %w", err)
 	}
@@ -237,12 +243,17 @@ func (s *Store) BasicCheck(object model.Object) error {
 	if metadata.AccountID != object.AccountID || metadata.Kind != object.Kind || metadata.Collection != object.Collection || metadata.CollectionID != object.CollectionRemoteID || metadata.RemoteID != object.RemoteID || metadata.ETag != object.ETag || metadata.ContentType != object.ContentType || metadata.Size != object.Size || metadata.SHA256 != object.SHA256 || !slices.Equal(metadata.Flags, object.Flags) || !equalTime(metadata.InternalDate, object.InternalDate) || !slices.Equal(metadata.RemoteCollections, object.RemoteCollections) {
 		return errors.New("object sidecar does not match the catalog")
 	}
-	info, err := os.Lstat(path)
+	file, err := s.Open(object)
 	if err != nil {
 		return err
 	}
-	if !info.Mode().IsRegular() {
-		return errors.New("object payload is not a regular file")
+	info, err := file.Stat()
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	if info.Size() != object.Size {
 		return fmt.Errorf("size is %d, catalog records %d", info.Size(), object.Size)
@@ -254,8 +265,7 @@ func (s *Store) Verify(ctx context.Context, object model.Object) error {
 	if err := s.BasicCheck(object); err != nil {
 		return err
 	}
-	path, _ := s.Resolve(object.Path)
-	file, err := os.Open(path)
+	file, err := s.Open(object)
 	if err != nil {
 		return err
 	}
@@ -274,8 +284,12 @@ func (s *Store) Verify(ctx context.Context, object model.Object) error {
 	if digest := hex.EncodeToString(hash.Sum(nil)); digest != object.SHA256 {
 		return fmt.Errorf("SHA-256 is %s, catalog records %s", digest, object.SHA256)
 	}
-	_, err = verifyFile(path, object.Kind)
-	return err
+	file, err = s.Open(object)
+	if err != nil {
+		return err
+	}
+	_, verifyErr := verifyReader(file, object.Kind)
+	return errors.Join(verifyErr, file.Close())
 }
 
 func (s *Store) Resolve(relative string) (string, error) {
@@ -290,6 +304,9 @@ func (s *Store) Resolve(relative string) (string, error) {
 	rel, err := filepath.Rel(s.dataDir, absolute)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", errors.New("object path escapes the data directory")
+	}
+	if err := rejectSymlinks(s.dataDir, absolute); err != nil {
+		return "", err
 	}
 	return absolute, nil
 }
@@ -422,15 +439,19 @@ func verifyFile(path, kind string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
+	return verifyReader(file, kind)
+}
+
+func verifyReader(reader io.Reader, kind string) (string, error) {
 	if kind == "mail" {
-		message, err := mail.ReadMessage(file)
+		message, err := mail.ReadMessage(reader)
 		if err != nil {
 			return "", fmt.Errorf("parse MIME message: %w", err)
 		}
 		return message.Header.Get("Subject"), nil
 	}
 	if kind == "contact" {
-		card, err := vcard.NewDecoder(file).Decode()
+		card, err := vcard.NewDecoder(reader).Decode()
 		if err != nil {
 			return "", fmt.Errorf("parse vCard: %w", err)
 		}
@@ -443,7 +464,7 @@ func verifyFile(path, kind string) (string, error) {
 		}
 		return formattedName.Value, nil
 	}
-	calendar, err := ical.NewDecoder(file).Decode()
+	calendar, err := ical.NewDecoder(reader).Decode()
 	if err != nil {
 		return "", fmt.Errorf("parse iCalendar: %w", err)
 	}
@@ -488,6 +509,105 @@ func safeID(value string) bool {
 	return true
 }
 
+func ensurePrivateDirectories(root, target string) error {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !rootInfo.Mode().IsDir() {
+		return errors.New("object store root is not a plain directory")
+	}
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("directory escapes the object store")
+	}
+	current := root
+	parts := []string{}
+	if relative != "." {
+		parts = strings.Split(relative, string(filepath.Separator))
+	}
+	for _, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+				return err
+			}
+			info, err = os.Lstat(current)
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsDir() {
+			return fmt.Errorf("object store path %s is not a plain directory", current)
+		}
+		if err := os.Chmod(current, 0o700); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectSymlinks(root, target string) error {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !rootInfo.Mode().IsDir() {
+		return errors.New("object store root is not a plain directory")
+	}
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("object path escapes the data directory")
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "." || part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("object store path %s is a symlink", current)
+		}
+	}
+	return nil
+}
+
+func (s *Store) writeJSON(relative string, value any) error {
+	return atomicfile.WriteRoot(s.root, filepath.ToSlash(relative), 0o600, func(w io.Writer) error {
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(value)
+	})
+}
+func (s *Store) readMetadata(relative string) (Metadata, error) {
+	var value Metadata
+	file, err := s.root.Open(filepath.ToSlash(relative))
+	if err != nil {
+		return value, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		file.Close()
+		if err == nil {
+			err = errors.New("object metadata is not a regular file")
+		}
+		return value, err
+	}
+	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(&value)
+	err = errors.Join(err, file.Close())
+	if err == nil && value.Format != format {
+		err = errors.New("unsupported object metadata format")
+	}
+	return value, err
+}
+
 func writeJSON(path string, value any) error {
 	return atomicfile.Write(path, 0o600, func(w io.Writer) error {
 		encoder := json.NewEncoder(w)
@@ -496,6 +616,13 @@ func writeJSON(path string, value any) error {
 	})
 }
 func readJSON(path string, target any) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("object metadata is not a regular file")
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return err

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -125,7 +126,94 @@ func (c *Client) Collection(ctx context.Context) (Collection, error) {
 	return Collection{Name: "JMAP Mail", RemoteID: string(c.accountID), Kind: "mail", URL: c.client.SessionEndpoint}, nil
 }
 
-func (c *Client) Objects(ctx context.Context) ([]Object, string, error) {
+// Objects returns a full Email/query snapshot on the first run. Later runs use
+// Email/changes with the Email state committed by the previous run.
+func (c *Client) Objects(ctx context.Context, sinceState string) ([]Object, string, error) {
+	if sinceState != "" {
+		objects, state, err := c.changedObjects(ctx, sinceState)
+		var methodErr *gojmap.MethodError
+		if err == nil || !errors.As(err, &methodErr) || methodErr.Type != "cannotCalculateChanges" {
+			return objects, state, err
+		}
+		// Servers may discard old states. Rebuild a stable snapshot rather than
+		// leaving this account permanently stuck on an expired cursor.
+	}
+	return c.allObjects(ctx)
+}
+
+func (c *Client) changedObjects(ctx context.Context, sinceState string) ([]Object, string, error) {
+	ids := make(map[gojmap.ID]struct{})
+	state := sinceState
+	for {
+		response, err := c.do(ctx, &email.Changes{Account: c.accountID, SinceState: state, MaxChanges: 500})
+		if err != nil {
+			return nil, "", err
+		}
+		changes, ok := response.(*email.ChangesResponse)
+		if !ok {
+			return nil, "", errors.New("JMAP Email/changes returned an unexpected response")
+		}
+		if changes.OldState != "" && changes.OldState != state {
+			return nil, "", errors.New("JMAP Email/changes returned the wrong old state")
+		}
+		for _, id := range changes.Created {
+			ids[id] = struct{}{}
+		}
+		for _, id := range changes.Updated {
+			ids[id] = struct{}{}
+		}
+		for _, id := range changes.Destroyed {
+			delete(ids, id)
+		}
+		if changes.NewState == "" {
+			return nil, "", errors.New("JMAP Email/changes returned an empty state")
+		}
+		state = changes.NewState
+		if !changes.HasMoreChanges {
+			break
+		}
+	}
+	changed := make([]gojmap.ID, 0, len(ids))
+	for id := range ids {
+		changed = append(changed, id)
+	}
+	sort.Slice(changed, func(i, j int) bool { return changed[i] < changed[j] })
+	objects, fetchedState, err := c.getObjects(ctx, changed)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(changed) > 0 && fetchedState != state {
+		return nil, "", errors.New("JMAP Email state changed after Email/changes; retry the backup")
+	}
+	return objects, state, nil
+}
+
+func (c *Client) allObjects(ctx context.Context) ([]Object, string, error) {
+	ids, _, err := c.queryIDs(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	var objects []Object
+	var state string
+	if len(ids) == 0 {
+		objects, state, err = c.emptySnapshot(ctx)
+	} else {
+		objects, state, err = c.getObjects(ctx, ids)
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	confirmed, _, err := c.queryIDs(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if !slices.Equal(ids, confirmed) {
+		return nil, "", errors.New("JMAP Email/query changed while building the initial snapshot; retry the backup")
+	}
+	return objects, state, nil
+}
+
+func (c *Client) queryIDs(ctx context.Context) ([]gojmap.ID, string, error) {
 	ids := make([]gojmap.ID, 0)
 	position, queryState := int64(0), ""
 	for {
@@ -147,12 +235,28 @@ func (c *Client) Objects(ctx context.Context) ([]Object, string, error) {
 			break
 		}
 	}
+	return ids, queryState, nil
+}
+
+func (c *Client) emptySnapshot(ctx context.Context) ([]Object, string, error) {
+	// Email/get with one impossible local sentinel obtains the Email state
+	// without asking the server to return every message.
+	response, err := c.do(ctx, &email.Get{Account: c.accountID, IDs: []gojmap.ID{"pimbackup-invalid-id"}, Properties: []string{"id"}})
+	if err != nil {
+		return nil, "", err
+	}
+	page, ok := response.(*email.GetResponse)
+	if !ok || page.State == "" {
+		return nil, "", errors.New("JMAP Email/get returned no state")
+	}
+	return []Object{}, page.State, nil
+}
+
+func (c *Client) getObjects(ctx context.Context, ids []gojmap.ID) ([]Object, string, error) {
 	objects := make([]Object, 0, len(ids))
+	state := ""
 	for start := 0; start < len(ids); start += c.maxObjectsInGet {
-		end := start + c.maxObjectsInGet
-		if end > len(ids) {
-			end = len(ids)
-		}
+		end := min(start+c.maxObjectsInGet, len(ids))
 		response, err := c.do(ctx, &email.Get{Account: c.accountID, IDs: ids[start:end], Properties: []string{"id", "blobId", "subject", "receivedAt", "keywords", "mailboxIds"}})
 		if err != nil {
 			return nil, "", err
@@ -161,19 +265,20 @@ func (c *Client) Objects(ctx context.Context) ([]Object, string, error) {
 		if !ok {
 			return nil, "", errors.New("JMAP Email/get returned an unexpected response")
 		}
-		if len(page.NotFound) > 0 {
+		if len(page.NotFound) > 0 || len(page.List) != end-start {
 			return nil, "", errors.New("JMAP messages changed while fetching; retry the backup")
 		}
-		if len(page.List) != end-start {
-			return nil, "", fmt.Errorf("JMAP Email/get returned %d of %d messages", len(page.List), end-start)
+		if state != "" && page.State != state {
+			return nil, "", errors.New("JMAP Email state changed while fetching; retry the backup")
 		}
+		state = page.State
 		for _, item := range page.List {
 			flags, mailboxIDs := trueKeys(item.Keywords), trueIDKeys(item.MailboxIDs)
 			objects = append(objects, Object{RemoteID: string(item.ID), BlobID: string(item.BlobID), ETag: objectTag(string(item.BlobID), flags, mailboxIDs, item.ReceivedAt), ContentType: "message/rfc822", Title: item.Subject, Flags: flags, MailboxIDs: mailboxIDs, ReceivedAt: item.ReceivedAt})
 		}
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].RemoteID < objects[j].RemoteID })
-	return objects, queryState, nil
+	return objects, state, nil
 }
 
 func (c *Client) Get(ctx context.Context, object Object) (io.ReadCloser, error) {
@@ -268,6 +373,9 @@ func (c *Client) do(ctx context.Context, method gojmap.Method) (gojmap.MethodRes
 		return nil, fmt.Errorf("JMAP %s returned %d responses", method.Name(), len(response.Responses))
 	}
 	if response.Responses[0].Name == "error" {
+		if methodErr, ok := response.Responses[0].Args.(*gojmap.MethodError); ok {
+			return nil, fmt.Errorf("JMAP %s: %w", method.Name(), methodErr)
+		}
 		return nil, fmt.Errorf("JMAP %s returned a method error", method.Name())
 	}
 	methodResponse, ok := response.Responses[0].Args.(gojmap.MethodResponse)

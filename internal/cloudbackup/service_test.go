@@ -2,6 +2,8 @@ package cloudbackup
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,27 +13,32 @@ import (
 	"github.com/lauritsk/backup/internal/cloudbackup/model"
 )
 
-type fakeRclone struct{ files map[string]string }
+type fakeRclone struct {
+	files map[string]string
+	fail  map[string]bool
+}
 
 func (fakeRclone) Version(context.Context) error                          { return nil }
 func (fakeRclone) CheckSource(context.Context, config.SourceConfig) error { return nil }
-func (f fakeRclone) Copy(_ context.Context, _ config.SourceConfig, destination string) error {
+func (f fakeRclone) Inventory(context.Context, config.SourceConfig) ([]model.RemoteFile, error) {
+	files := make([]model.RemoteFile, 0, len(f.files))
 	for name, contents := range f.files {
-		path := filepath.Join(destination, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return err
-		}
-		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-			return err
-		}
+		files = append(files, model.RemoteFile{Path: name, Size: int64(len(contents)), ModTime: time.Unix(1, 0).UTC()})
 	}
-	return nil
+	return files, nil
+}
+func (f fakeRclone) Download(_ context.Context, _ config.SourceConfig, name string, destination io.Writer) error {
+	if f.fail[name] {
+		return errors.New("remote read failed")
+	}
+	_, err := io.WriteString(destination, f.files[name])
+	return err
 }
 
 func TestBackupVerifyRestoreRoundTrip(t *testing.T) {
 	dataDir := t.TempDir()
 	remote := fakeRclone{files: map[string]string{"docs/report.txt": "original"}}
-	cfg := config.Config{DataDir: dataDir, Rclone: config.RcloneConfig{Binary: "rclone"}, Sources: []config.SourceConfig{{ID: "documents", Remote: "test:docs", Timeout: config.Duration{Duration: time.Minute}}}}
+	cfg := config.Config{DataDir: dataDir, Rclone: config.RcloneConfig{}, Sources: []config.SourceConfig{{ID: "documents", Remote: "test:docs", Timeout: config.Duration{Duration: time.Minute}}}}
 	service, err := OpenService(context.Background(), cfg, ServiceOptions{Rclone: remote})
 	if err != nil {
 		t.Fatal(err)
@@ -79,10 +86,48 @@ func TestBackupVerifyRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPartialAcquisitionSurvivesOlderManifestReconciliation(t *testing.T) {
+	dataDir := t.TempDir()
+	remote := fakeRclone{files: map[string]string{"a.txt": "old-a", "b.txt": "old-b"}, fail: map[string]bool{}}
+	cfg := config.Config{DataDir: dataDir, Rclone: config.RcloneConfig{}, Sources: []config.SourceConfig{{ID: "source", Remote: "test:", Timeout: config.Duration{Duration: time.Minute}}}}
+	service, err := OpenService(context.Background(), cfg, ServiceOptions{Rclone: remote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Backup(context.Background(), model.BackupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	remote.files["a.txt"] = "new-a"
+	remote.files["b.txt"] = "new-b"
+	remote.fail["b.txt"] = true
+	if _, err := service.Backup(context.Background(), model.BackupRequest{}); err == nil {
+		t.Fatal("partial backup unexpectedly succeeded")
+	}
+	newRecord, err := service.GetFile(context.Background(), "source", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenService(context.Background(), cfg, ServiceOptions{Rclone: remote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reconciled, err := reopened.GetFile(context.Background(), "source", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.SHA256 != newRecord.SHA256 || reconciled.LastRunID != newRecord.LastRunID {
+		t.Fatalf("older manifest replaced partial durable commit: before=%#v after=%#v", newRecord, reconciled)
+	}
+}
+
 func TestBackupDoesNotDeleteLocalFileMissingFromRemote(t *testing.T) {
 	dataDir := t.TempDir()
 	remote := fakeRclone{files: map[string]string{"keep.txt": "keep", "gone.txt": "retained"}}
-	cfg := config.Config{DataDir: dataDir, Rclone: config.RcloneConfig{Binary: "rclone"}, Sources: []config.SourceConfig{{ID: "source", Remote: "test:", Timeout: config.Duration{Duration: time.Minute}}}}
+	cfg := config.Config{DataDir: dataDir, Rclone: config.RcloneConfig{}, Sources: []config.SourceConfig{{ID: "source", Remote: "test:", Timeout: config.Duration{Duration: time.Minute}}}}
 	service, err := OpenService(context.Background(), cfg, ServiceOptions{Rclone: remote})
 	if err != nil {
 		t.Fatal(err)

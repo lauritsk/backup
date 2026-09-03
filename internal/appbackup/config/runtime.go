@@ -21,7 +21,6 @@ func (cfg Config) EffectiveVerificationCommand(database DatabaseConfig) *Command
 	if engineType == "" || cfg.Engine == nil || cfg.Engine.Type != engineType {
 		return &command
 	}
-	command.Binary = cfg.Engine.Binary
 	option := "--host"
 	if engineType == "podman" {
 		option = "--url"

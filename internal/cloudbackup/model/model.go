@@ -16,6 +16,14 @@ type RestoreRequest struct {
 	Confirm  bool     `json:"confirm"`
 }
 
+type RemoteFile struct {
+	Path    string            `json:"Path"`
+	Size    int64             `json:"Size"`
+	ModTime time.Time         `json:"ModTime"`
+	IsDir   bool              `json:"IsDir"`
+	Hashes  map[string]string `json:"Hashes"`
+}
+
 type File struct {
 	SourceID          string     `json:"source_id"`
 	Path              string     `json:"path"`

@@ -1,5 +1,7 @@
 [tools]
 go = "latest"
+rclone = "latest"
+restic = "latest"
 sqlite = "latest"
 
 [tasks.build]
