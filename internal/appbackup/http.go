@@ -1,4 +1,4 @@
-package cloudbackup
+package appbackup
 
 import (
 	"context"
@@ -6,17 +6,16 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
-	"strconv"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/lauritsk/backup/internal/appbackup/catalog"
+	"github.com/lauritsk/backup/internal/appbackup/model"
 	"github.com/lauritsk/backup/internal/buildinfo"
-	"github.com/lauritsk/backup/internal/cloudbackup/catalog"
-	"github.com/lauritsk/backup/internal/cloudbackup/model"
 	"github.com/lauritsk/backup/internal/httpapi"
 	"github.com/lauritsk/backup/internal/safeerror"
 )
@@ -99,12 +98,10 @@ func (s *Service) HTTPHandler(info buildinfo.Info) http.Handler {
 		writeHTTPJSON(w, 200, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /api/v1/version", func(w http.ResponseWriter, _ *http.Request) { writeHTTPJSON(w, 200, info) })
-	mux.HandleFunc("GET /api/v1/sources", s.handleSources)
-	mux.HandleFunc("GET /api/v1/files", s.handleFiles)
-	mux.HandleFunc("GET /api/v1/file", s.handleFile)
-	mux.HandleFunc("GET /api/v1/file/raw", s.handleRawFile)
-	mux.HandleFunc("GET /api/v1/manifests", s.handleManifests)
-	mux.HandleFunc("GET /api/v1/manifests/{id}", s.handleManifest)
+	mux.HandleFunc("GET /api/v1/applications", s.handleApplications)
+	mux.HandleFunc("GET /api/v1/recovery-points", s.handleRecoveryPoints)
+	mux.HandleFunc("GET /api/v1/recovery-points/{id}", s.handleRecoveryPoint)
+	mux.HandleFunc("GET /api/v1/recovery-points/{id}/contents", s.handleContents)
 	mux.HandleFunc("GET /api/v1/runs", s.handleRuns)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.handleRun)
 	mux.HandleFunc("POST /api/v1/backup", s.handleBackup)
@@ -140,7 +137,7 @@ func (s *Service) authenticate(next http.Handler) http.Handler {
 		}
 		got := sha256.Sum256([]byte(provided))
 		if !valid || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="cloudbackup"`)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="appbackup"`)
 			writeAPIError(w, 401, "unauthorized", "a valid bearer token is required")
 			return
 		}
@@ -159,74 +156,47 @@ func loopbackHost(value string) bool {
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }
-func (s *Service) handleSources(w http.ResponseWriter, r *http.Request) {
-	value, err := s.ListSources(r.Context())
+func (s *Service) handleApplications(w http.ResponseWriter, r *http.Request) {
+	value, err := s.ListApplications(r.Context())
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	writeHTTPJSON(w, 200, map[string]any{"sources": value})
+	writeHTTPJSON(w, 200, map[string]any{"applications": value})
 }
-func (s *Service) handleFiles(w http.ResponseWriter, r *http.Request) {
+func (s *Service) handleRecoveryPoints(w http.ResponseWriter, r *http.Request) {
 	limit, offset, err := pagination(r)
 	if err != nil {
 		writeAPIError(w, 400, "invalid_request", err.Error())
 		return
 	}
-	value, err := s.ListFiles(r.Context(), r.URL.Query().Get("source"), r.URL.Query().Get("prefix"), limit, offset)
+	value, err := s.ListRecoveryPoints(r.Context(), r.URL.Query().Get("application"), limit, offset)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	writeHTTPJSON(w, 200, map[string]any{"files": value, "limit": limit, "offset": offset})
+	writeHTTPJSON(w, 200, map[string]any{"recovery_points": value, "limit": limit, "offset": offset})
 }
-func (s *Service) handleFile(w http.ResponseWriter, r *http.Request) {
-	value, err := s.GetFile(r.Context(), r.URL.Query().Get("source"), r.URL.Query().Get("path"))
+func (s *Service) handleRecoveryPoint(w http.ResponseWriter, r *http.Request) {
+	value, err := s.GetRecoveryPoint(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
 	writeHTTPJSON(w, 200, value)
 }
-func (s *Service) handleRawFile(w http.ResponseWriter, r *http.Request) {
-	file, opened, err := s.OpenFile(r.Context(), r.URL.Query().Get("source"), r.URL.Query().Get("path"))
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	defer opened.Close()
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
-	w.Header().Set("ETag", `"sha256:`+file.SHA256+`"`)
-	w.WriteHeader(200)
-	_, _ = io.Copy(w, opened)
-}
-func (s *Service) handleManifests(w http.ResponseWriter, r *http.Request) {
+func (s *Service) handleContents(w http.ResponseWriter, r *http.Request) {
 	limit, offset, err := pagination(r)
 	if err != nil {
 		writeAPIError(w, 400, "invalid_request", err.Error())
 		return
 	}
-	value, err := s.ListManifests(r.Context(), r.URL.Query().Get("source"), limit, offset)
+	value, err := s.ListRecoveryPointContents(r.Context(), r.PathValue("id"), limit, offset)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	writeHTTPJSON(w, 200, map[string]any{"manifests": value, "limit": limit, "offset": offset})
-}
-func (s *Service) handleManifest(w http.ResponseWriter, r *http.Request) {
-	source := r.URL.Query().Get("source")
-	if source == "" {
-		writeAPIError(w, 400, "invalid_request", "source is required")
-		return
-	}
-	value, err := s.GetManifest(r.Context(), source, r.PathValue("id"))
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	writeHTTPJSON(w, 200, value)
+	writeHTTPJSON(w, 200, map[string]any{"paths": value, "limit": limit, "offset": offset})
 }
 func (s *Service) handleRuns(w http.ResponseWriter, r *http.Request) {
 	limit, offset, err := pagination(r)
@@ -302,7 +272,7 @@ var (
 
 func writeServiceError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, catalog.ErrNotFound):
+	case errors.Is(err, catalog.ErrNotFound), errors.Is(err, os.ErrNotExist):
 		writeAPIError(w, 404, "not_found", "record not found")
 	case errors.Is(err, ErrOperationBusy):
 		writeAPIError(w, 409, "operation_busy", err.Error())

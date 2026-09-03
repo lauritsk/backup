@@ -4,20 +4,20 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"mime"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/lauritsk/backup/internal/buildinfo"
+	"github.com/lauritsk/backup/internal/httpapi"
 	"github.com/lauritsk/backup/internal/pimbackup/catalog"
 	"github.com/lauritsk/backup/internal/pimbackup/model"
+	"github.com/lauritsk/backup/internal/safeerror"
 )
 
 func (s *Service) Serve(ctx context.Context, info buildinfo.Info) error {
@@ -206,18 +206,9 @@ func (s *Service) handleMailboxes(writer http.ResponseWriter, request *http.Requ
 }
 
 func (s *Service) handleMessages(writer http.ResponseWriter, request *http.Request) {
-	limit, err := queryInt(request, "limit", 100)
+	limit, offset, err := pagination(request)
 	if err != nil {
 		writeAPIError(writer, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	offset, err := queryInt(request, "offset", 0)
-	if err != nil {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if limit < 1 || limit > 1000 || offset < 0 {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 1000 and offset cannot be negative")
 		return
 	}
 	uidValidity, err := queryUint32(request, "uid_validity", 0)
@@ -297,14 +288,9 @@ func (s *Service) handleCollections(writer http.ResponseWriter, request *http.Re
 }
 
 func (s *Service) handleObjects(writer http.ResponseWriter, request *http.Request) {
-	limit, err := queryInt(request, "limit", 100)
+	limit, offset, err := pagination(request)
 	if err != nil {
 		writeAPIError(writer, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	offset, err := queryInt(request, "offset", 0)
-	if err != nil || limit < 1 || limit > 1000 || offset < 0 {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 1000 and offset cannot be negative")
 		return
 	}
 	kind := request.URL.Query().Get("kind")
@@ -361,18 +347,9 @@ func (s *Service) handleRawObject(writer http.ResponseWriter, request *http.Requ
 }
 
 func (s *Service) handleRuns(writer http.ResponseWriter, request *http.Request) {
-	limit, err := queryInt(request, "limit", 100)
+	limit, offset, err := pagination(request)
 	if err != nil {
 		writeAPIError(writer, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	offset, err := queryInt(request, "offset", 0)
-	if err != nil {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if limit < 1 || limit > 1000 || offset < 0 {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 1000 and offset cannot be negative")
 		return
 	}
 	runs, err := s.ListRuns(request.Context(), limit, offset)
@@ -438,46 +415,12 @@ func (s *Service) handleRestore(writer http.ResponseWriter, request *http.Reques
 	writeJSON(writer, http.StatusAccepted, run)
 }
 
-func decodeOptionalJSON(writer http.ResponseWriter, request *http.Request, target any) error {
-	if err := requireJSONContentType(request); err != nil {
-		return err
-	}
-	if request.Body == nil || request.ContentLength == 0 {
-		return nil
-	}
-	err := decodeJSON(writer, request, target)
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
-	return err
-}
-
-func decodeJSON(writer http.ResponseWriter, request *http.Request, target any) error {
-	if err := requireJSONContentType(request); err != nil {
-		return err
-	}
-	reader := http.MaxBytesReader(writer, request.Body, 1<<20)
-	decoder := json.NewDecoder(reader)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		if errors.Is(err, io.EOF) {
-			return io.EOF
-		}
-		return fmt.Errorf("decode JSON body: %w", err)
-	}
-	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return errors.New("JSON body must contain one value")
-	}
-	return nil
-}
-
-func requireJSONContentType(request *http.Request) error {
-	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		return errors.New("Content-Type must be application/json")
-	}
-	return nil
-}
+var (
+	decodeOptionalJSON = httpapi.DecodeOptionalJSON
+	decodeJSON         = httpapi.DecodeJSON
+	pagination         = httpapi.Pagination
+	writeJSON          = httpapi.WriteJSON
+)
 
 func pathID(request *http.Request) (int64, error) {
 	value, err := strconv.ParseInt(request.PathValue("id"), 10, 64)
@@ -485,18 +428,6 @@ func pathID(request *http.Request) (int64, error) {
 		return 0, errors.New("message id must be a positive integer")
 	}
 	return value, nil
-}
-
-func queryInt(request *http.Request, name string, fallback int) (int, error) {
-	value := request.URL.Query().Get(name)
-	if value == "" {
-		return fallback, nil
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer", name)
-	}
-	return parsed, nil
 }
 
 func queryUint32(request *http.Request, name string, fallback uint32) (uint32, error) {
@@ -530,25 +461,10 @@ func writeServiceError(writer http.ResponseWriter, err error) {
 	case errors.Is(err, ErrOperationBusy):
 		writeAPIError(writer, http.StatusConflict, "operation_busy", err.Error())
 	default:
-		writeAPIError(writer, http.StatusInternalServerError, "operation_failed", err.Error())
+		writeAPIError(writer, http.StatusInternalServerError, "operation_failed", safeerror.Clean(err).Error())
 	}
 }
 
 func writeAPIError(writer http.ResponseWriter, status int, code, message string) {
 	writeJSON(writer, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
-}
-
-func writeJSON(writer http.ResponseWriter, status int, value any) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		status = http.StatusInternalServerError
-		encoded = []byte(`{"error":{"code":"encoding_failed","message":"response encoding failed"}}`)
-	}
-	encoded = append(encoded, '\n')
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("X-Content-Type-Options", "nosniff")
-	writer.Header().Set("Cache-Control", "no-store")
-	writer.Header().Set("Content-Length", strconv.Itoa(len(encoded)))
-	writer.WriteHeader(status)
-	_, _ = writer.Write(encoded)
 }
