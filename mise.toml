@@ -6,6 +6,7 @@ lockfile = true
 
 [tools]
 actionlint = "1.7.12"
+cocogitto = "7.0.0"
 go = "1.27.1"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
 restic = "0.19.1"
@@ -13,6 +14,10 @@ restic = "0.19.1"
 [tasks.build]
 description = "Build all binaries"
 run = "mkdir -p bin && go build -o bin/ ./cmd/..."
+
+[tasks."commits:check"]
+description = "Check conventional commit compliance"
+run = "cog check"
 
 [tasks.fmt]
 description = "Format Go source"
@@ -68,7 +73,7 @@ run = "go vet ./..."
 
 [tasks.check]
 description = "Run local checks and build"
-depends = ["audit", "deps:check", "fmt:check", "workflow:check", "test", "vet", "build"]
+depends = ["audit", "commits:check", "deps:check", "fmt:check", "workflow:check", "test", "vet", "build"]
 
 [tasks.clean]
 description = "Remove generated files"
