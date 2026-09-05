@@ -16,6 +16,10 @@ local checks = new Mapping<String, Step> {
     check = "go build ./cmd/..."
   }
   ["go-fmt"] = Builtins.go_fmt
+  ["goreleaser"] {
+    glob = ".goreleaser.yaml"
+    check = "goreleaser check"
+  }
   ["go-test"] {
     glob = goFiles
     workspace_indicator = "go.mod"

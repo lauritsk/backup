@@ -13,10 +13,13 @@ postinstall = "hk install --mise"
 [tools]
 actionlint = "1.7.12"
 cocogitto = "7.0.0"
+cosign = "3.1.3"
 go = "1.27.1"
+goreleaser = "2.18.0"
 hk = "1.57.0"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
 restic = "0.19.1"
+syft = "1.51.1"
 
 [tasks.build]
 description = "Build all binaries"
@@ -28,7 +31,7 @@ run = "hk check --all"
 
 [tasks.clean]
 description = "Remove generated files"
-run = "rm -rf bin"
+run = "rm -rf bin dist"
 
 [tasks."deps:update"]
 description = "Update Go dependencies"

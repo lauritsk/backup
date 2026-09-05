@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+
+version: 2
+
+builds:
+  - main: ./cmd/...
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/lauritsk/backup/internal/buildinfo.Version={{ .Version }}
+        -X github.com/lauritsk/backup/internal/buildinfo.Revision={{ .Commit }}
+        -X github.com/lauritsk/backup/internal/buildinfo.BuildTime={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+gomod:
+  proxy: true
+
+archives:
+  - wrap_in_directory: true
+    builds_info:
+      mtime: "{{ .CommitDate }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+source:
+  enabled: true
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+  - id: source
+    artifacts: source
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - --yes
+    artifacts: checksum
+
+release:
+  draft: true
+  prerelease: auto
+  preflight:
+    fail_on_error: true
