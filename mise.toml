@@ -1,10 +1,14 @@
+min_version = "2026.9.1"
+
+[settings]
+locked = true
+lockfile = true
+
 [tools]
-actionlint = "latest"
-go = "latest"
-"go:golang.org/x/vuln/cmd/govulncheck" = "latest"
-rclone = "latest"
-restic = "latest"
-sqlite = "latest"
+actionlint = "1.7.12"
+go = "1.27.1"
+"go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
+restic = "0.19.1"
 
 [tasks.build]
 description = "Build all binaries"
