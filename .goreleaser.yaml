@@ -48,8 +48,12 @@ signs:
       - --yes
     artifacts: checksum
 
+changelog:
+  disable: true
+
 release:
   draft: true
+  replace_existing_draft: true
   prerelease: auto
   preflight:
     fail_on_error: true

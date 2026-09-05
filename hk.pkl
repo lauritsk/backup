@@ -20,6 +20,11 @@ local checks = new Mapping<String, Step> {
     glob = ".goreleaser.yaml"
     check = "goreleaser check"
   }
+  ["goreleaser-snapshot"] {
+    glob = List(".goreleaser.yaml", "**/*.go", "**/go.mod", "**/go.sum")
+    profiles = List("release")
+    check = "goreleaser release --snapshot --clean --skip=sign && rm -rf dist"
+  }
   ["go-test"] {
     glob = goFiles
     workspace_indicator = "go.mod"
