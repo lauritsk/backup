@@ -35,3 +35,6 @@ hk.local.pkl
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Release artifacts
+dist/

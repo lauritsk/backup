@@ -13,10 +13,14 @@ postinstall = "hk install --mise"
 [tools]
 actionlint = "1.7.12"
 cocogitto = "7.0.0"
+cosign = "3.1.3"
 go = "1.27.1"
+goreleaser = "2.18.0"
+gitsign = "0.17.1"
 hk = "1.57.0"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
 restic = "0.19.1"
+syft = "1.51.1"
 
 [tasks.build]
 description = "Build all binaries"
@@ -28,15 +32,65 @@ run = "hk check --all"
 
 [tasks.clean]
 description = "Remove generated files"
-run = "rm -rf bin"
+run = "rm -rf bin dist"
 
 [tasks."deps:update"]
-description = "Update Go dependencies"
-run = "go get -u ./... && go mod tidy"
+description = "Update Go dependencies and mise tools"
+run = '''
+set -eu
+go get -u ./...
+go mod tidy
+MISE_LOCKED=0 mise upgrade --bump --local
+mise run check
+'''
 
 [tasks.fix]
 description = "Apply automatic fixes"
 run = "hk fix --all"
+
+[tasks.release]
+description = "Check and push the next signed release tag"
+confirm = "Create and push the next release?"
+run = '''
+set -eu
+
+if [ "$(git branch --show-current)" != "main" ]; then
+  echo "release must run from main" >&2
+  exit 1
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  echo "release requires a clean working tree" >&2
+  exit 1
+fi
+
+git fetch --quiet --tags origin main
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  echo "local main must match origin/main" >&2
+  exit 1
+fi
+
+mise run release:check
+tag=$(cog bump --auto --dry-run)
+if ! printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+  echo "cocogitto did not produce a release version: $tag" >&2
+  exit 1
+fi
+if git show-ref --verify --quiet "refs/tags/$tag"; then
+  echo "tag already exists: $tag" >&2
+  exit 1
+fi
+
+git tag --sign --message "$tag" "$tag"
+gitsign verify-tag \
+  --certificate-identity karl@laurits.dev \
+  --certificate-oidc-issuer https://accounts.google.com \
+  "$tag"
+git push --atomic origin "HEAD:refs/heads/main" "refs/tags/$tag:refs/tags/$tag"
+'''
+
+[tasks."release:check"]
+description = "Run checks and build a release snapshot"
+run = "hk check --all --profile release"
 
 [tasks."run:pimbackup"]
 description = "Run pimbackup from source"
