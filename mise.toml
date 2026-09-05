@@ -4,10 +4,17 @@ min_version = "2026.9.1"
 locked = true
 lockfile = true
 
+[env]
+HK_MISE = 1
+
+[hooks]
+postinstall = "hk install --mise"
+
 [tools]
 actionlint = "1.7.12"
 cocogitto = "7.0.0"
 go = "1.27.1"
+hk = "1.57.0"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
 restic = "0.19.1"
 
@@ -15,66 +22,27 @@ restic = "0.19.1"
 description = "Build all binaries"
 run = "mkdir -p bin && go build -o bin/ ./cmd/..."
 
-[tasks."commits:check"]
-description = "Check conventional commit compliance"
-run = "cog check"
+[tasks.check]
+description = "Run all checks"
+run = "hk check --all"
 
-[tasks.fmt]
-description = "Format Go source"
-run = "find cmd internal -name '*.go' -exec gofmt -w {} +"
-
-[tasks."fmt:check"]
-description = "Check Go source formatting"
-run = '''
-unformatted="$(find cmd internal -name '*.go' -exec gofmt -l {} +)"
-if [ -n "$unformatted" ]; then
-  echo "Files need gofmt:"
-  echo "$unformatted"
-  exit 1
-fi
-'''
-
-[tasks.deps]
-description = "Tidy Go dependencies"
-run = "go mod tidy"
-
-[tasks."deps:check"]
-description = "Check that Go module files are tidy"
-run = "go mod tidy -diff"
+[tasks.clean]
+description = "Remove generated files"
+run = "rm -rf bin"
 
 [tasks."deps:update"]
 description = "Update Go dependencies"
 run = "go get -u ./... && go mod tidy"
 
-[tasks.audit]
-description = "Scan Go dependencies for known vulnerabilities"
-run = "govulncheck ./..."
-
-[tasks."workflow:check"]
-description = "Lint GitHub Actions workflows"
-run = "actionlint"
-
-[tasks.test]
-description = "Run tests"
-run = "go test ./..."
-
-[tasks."test:race"]
-description = "Run tests with the race detector"
-run = "go test -race ./..."
+[tasks.fix]
+description = "Apply automatic fixes"
+run = "hk fix --all"
 
 [tasks."run:pimbackup"]
 description = "Run pimbackup from source"
 raw = true
 run = "go run ./cmd/pimbackup"
 
-[tasks.vet]
-description = "Run go vet"
-run = "go vet ./..."
-
-[tasks.check]
-description = "Run local checks and build"
-depends = ["audit", "commits:check", "deps:check", "fmt:check", "workflow:check", "test", "vet", "build"]
-
-[tasks.clean]
-description = "Remove generated files"
-run = "rm -rf bin"
+[tasks."test:race"]
+description = "Run tests with the race detector"
+run = "hk check --all --profile race --step go-test-race"

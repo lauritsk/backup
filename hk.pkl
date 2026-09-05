@@ -1,0 +1,56 @@
+amends "package://github.com/jdx/hk/releases/download/v1.57.0/hk@1.57.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.57.0/hk@1.57.0#/Builtins.pkl"
+
+local goFiles = List("**/*.go", "**/go.mod", "**/go.sum")
+
+local checks = new Mapping<String, Step> {
+  ["actionlint"] = Builtins.actionlint
+  ["cocogitto"] {
+    glob = "cog.toml"
+    check = "cog check"
+  }
+  ["go-build"] {
+    glob = goFiles
+    workspace_indicator = "go.mod"
+    dir = "{{workspace}}"
+    check = "go build ./cmd/..."
+  }
+  ["go-fmt"] = Builtins.go_fmt
+  ["go-test"] {
+    glob = goFiles
+    workspace_indicator = "go.mod"
+    dir = "{{workspace}}"
+    check = "go test ./..."
+  }
+  ["go-test-race"] {
+    glob = goFiles
+    workspace_indicator = "go.mod"
+    dir = "{{workspace}}"
+    profiles = List("race")
+    check = "go test -race ./..."
+  }
+  ["go-vet"] = Builtins.go_vet
+  ["go-vuln-check"] = Builtins.go_vuln_check
+  ["gomod-tidy"] = Builtins.gomod_tidy
+  ["mise"] = Builtins.mise
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = checks
+  }
+  ["commit-msg"] {
+    steps {
+      ["cocogitto"] = Builtins.cocogitto_commit_msg
+    }
+  }
+  ["fix"] {
+    fix = true
+    steps = checks
+  }
+  ["check"] {
+    steps = checks
+  }
+}
