@@ -19,7 +19,7 @@ func (s *Service) Check(ctx context.Context) model.CheckReport {
 		result := model.CheckResult{Name: name, Status: "ok", Duration: time.Since(started)}
 		if err != nil {
 			result.Status = "error"
-			result.Message = err.Error()
+			result.Message = s.cleanError(err)
 			report.Status = "error"
 		}
 		report.Checks = append(report.Checks, result)
@@ -89,12 +89,12 @@ func (s *Service) checkStorage() error {
 	return atomicfile.SyncDir(s.config.DataDir)
 }
 
-func (s *Service) Rebuild(ctx context.Context) (model.RebuildReport, error) {
+func (s *Service) Rebuild(ctx context.Context) (report model.RebuildReport, resultErr error) {
 	release, err := s.gate.TryAcquire()
 	if err != nil {
 		return model.RebuildReport{}, err
 	}
-	defer release()
+	defer func() { resultErr = errors.Join(resultErr, release()) }()
 	if err := s.ensureInitialized(ctx); err != nil {
 		return model.RebuildReport{}, err
 	}
@@ -105,9 +105,9 @@ func (s *Service) Rebuild(ctx context.Context) (model.RebuildReport, error) {
 	if err := ctx.Err(); err != nil {
 		return model.RebuildReport{}, err
 	}
-	report := model.RebuildReport{}
+	report = model.RebuildReport{}
 	for _, scanErr := range scan.Errors {
-		report.Errors = append(report.Errors, scanErr.Error())
+		report.Errors = append(report.Errors, s.cleanError(scanErr))
 	}
 	if err := s.catalog.PrepareRebuild(ctx); err != nil {
 		return report, err
@@ -132,7 +132,7 @@ func (s *Service) Rebuild(ctx context.Context) (model.RebuildReport, error) {
 	}
 	objectScan := s.objectStore.Scan(ctx)
 	for _, scanErr := range objectScan.Errors {
-		report.Errors = append(report.Errors, scanErr.Error())
+		report.Errors = append(report.Errors, s.cleanError(scanErr))
 	}
 	for _, scanned := range objectScan.Collections {
 		metadata := scanned.Metadata

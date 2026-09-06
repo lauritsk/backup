@@ -1,0 +1,12 @@
+{
+  "data_dir": "/data",
+  "accounts": [
+    {
+      "id": "personal",
+      "protocol": "imap",
+      "host": "imap.example.com",
+      "username": "person@example.com",
+      "password_file": "/run/secrets/pimbackup_password"
+    }
+  ]
+}

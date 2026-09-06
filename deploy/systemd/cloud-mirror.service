@@ -1,0 +1,34 @@
+[Unit]
+Description=Mirror remote cloud data into a local read-only backup source
+Documentation=https://github.com/lauritsk/backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=cloudmirror
+Group=backup
+UMask=0027
+StateDirectory=cloud-mirror
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/rclone sync archive:documents /var/lib/cloud-mirror/documents --config /run/credentials/cloud-mirror.service/rclone.conf --check-first --transfers 4
+LoadCredential=rclone.conf:/etc/backup/credentials/rclone.conf
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cloud-mirror
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+TimeoutStartSec=infinity

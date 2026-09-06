@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lauritsk/backup/internal/appbackup/model"
+	runmodel "github.com/lauritsk/backup/internal/run"
 )
 
 func TestStartupReconcilesInterruptedRecoveryPointAndStaging(t *testing.T) {
@@ -20,7 +21,14 @@ func TestStartupReconcilesInterruptedRecoveryPointAndStaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	point := model.RecoveryPoint{SchemaVersion: 1, ID: "unfinished", RunID: "run", ApplicationID: "site", Status: "running", StartedAt: time.Now().UTC(), Hooks: []model.HookResult{{Phase: "quiesce", Index: 0, Status: "succeeded", StartedAt: time.Now().UTC()}}}
+	run, err := service.catalog.CreateRun(context.Background(), runmodel.OperationBackup, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.catalog.StartRun(context.Background(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	point := model.RecoveryPoint{SchemaVersion: 1, ID: "unfinished", RunID: run.ID, ApplicationID: "site", Status: "running", StartedAt: time.Now().UTC(), Hooks: []model.HookResult{{Phase: "quiesce", Index: 0, Status: "succeeded", StartedAt: time.Now().UTC()}}}
 	if _, err := service.store.writeRecoveryPoint(point); err != nil {
 		t.Fatal(err)
 	}
@@ -51,5 +59,21 @@ func TestStartupReconcilesInterruptedRecoveryPointAndStaging(t *testing.T) {
 	}
 	if strings.Join(events, ",") != "thaw,post" {
 		t.Fatalf("cleanup hook events = %#v", events)
+	}
+	ghost := model.RecoveryPoint{SchemaVersion: 1, ID: "catalog-only", RunID: run.ID, ApplicationID: "site", Status: "succeeded", StartedAt: time.Now().UTC(), SnapshotID: "ghost"}
+	if err := reopened.catalog.ApplyRecoveryPoint(context.Background(), ghost, "missing/manifest.json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Repair(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	points, err := reopened.ListRecoveryPoints(context.Background(), "site", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, point := range points {
+		if point.ID == ghost.ID {
+			t.Fatal("repair retained a catalog row with no canonical manifest")
+		}
 	}
 }

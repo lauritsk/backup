@@ -18,8 +18,9 @@ import (
 var ErrNotFound = errors.New("catalog record not found")
 
 type Catalog struct {
-	db   *sql.DB
-	path string
+	db      *sql.DB
+	path    string
+	created bool
 }
 
 type Run struct {
@@ -45,10 +46,12 @@ func Open(ctx context.Context, dataDir string) (*Catalog, error) {
 		return nil, fmt.Errorf("set data directory permissions: %w", err)
 	}
 	databasePath := filepath.Join(dataDir, "pim.db")
+	created := false
 	if info, err := os.Lstat(databasePath); err == nil {
 		if !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("catalog path %s is not a regular file", databasePath)
 		}
+		created = info.Size() == 0
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect catalog path: %w", err)
 	} else {
@@ -65,6 +68,8 @@ func Open(ctx context.Context, dataDir string) (*Catalog, error) {
 			return nil, fmt.Errorf("create catalog file: %w", createErr)
 		} else if closeErr := file.Close(); closeErr != nil {
 			return nil, fmt.Errorf("close new catalog file: %w", closeErr)
+		} else {
+			created = true
 		}
 	}
 	if err := os.Chmod(databasePath, 0o600); err != nil {
@@ -77,7 +82,7 @@ func Open(ctx context.Context, dataDir string) (*Catalog, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	catalog := &Catalog{db: db, path: databasePath}
+	catalog := &Catalog{db: db, path: databasePath, created: created}
 	if err := catalog.initialize(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -91,6 +96,10 @@ func (c *Catalog) Close() error {
 
 func (c *Catalog) Path() string {
 	return c.path
+}
+
+func (c *Catalog) Created() bool {
+	return c.created
 }
 
 func (c *Catalog) Ping(ctx context.Context) error {

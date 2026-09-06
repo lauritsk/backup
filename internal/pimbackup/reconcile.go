@@ -25,7 +25,7 @@ func (s *Service) reconcile(ctx context.Context) error {
 		return err
 	}
 	for _, issue := range scan.Errors {
-		s.logger.Warn("canonical mail scan found an issue", "error", issue)
+		s.logger.Warn("canonical mail scan found an issue", "error", s.cleanError(issue))
 	}
 	for _, scanned := range scan.Mailboxes {
 		metadata := scanned.Metadata
@@ -63,7 +63,7 @@ func (s *Service) reconcile(ctx context.Context) error {
 
 	objectScan := s.objectStore.Scan(ctx)
 	for _, issue := range objectScan.Errors {
-		s.logger.Warn("canonical PIM object scan found an issue", "error", issue)
+		s.logger.Warn("canonical PIM object scan found an issue", "error", s.cleanError(issue))
 	}
 	for _, scanned := range objectScan.Collections {
 		metadata := scanned.Metadata
@@ -94,7 +94,7 @@ func (s *Service) reconcile(ctx context.Context) error {
 	}
 	for _, message := range messages {
 		if err := s.store.BasicCheck(message); err != nil {
-			s.logger.Warn("rewinding mailbox with missing or invalid canonical data", "message_id", message.ID, "account", message.AccountID, "mailbox", message.Mailbox, "uid", message.UID, "error", err)
+			s.logger.Warn("rewinding mailbox with missing or invalid canonical data", "message_id", message.ID, "account", message.AccountID, "mailbox", message.Mailbox, "uid", message.UID, "error", s.cleanError(err))
 			if rewindErr := s.catalog.RewindMailbox(ctx, message.MailboxID, message.UID); rewindErr != nil {
 				return rewindErr
 			}
@@ -106,7 +106,7 @@ func (s *Service) reconcile(ctx context.Context) error {
 	}
 	for _, object := range objects {
 		if err := s.objectStore.BasicCheck(object); err != nil {
-			s.logger.Warn("resetting collection with missing or invalid canonical data", "object_id", object.ID, "account", object.AccountID, "collection", object.Collection, "error", err)
+			s.logger.Warn("resetting collection with missing or invalid canonical data", "object_id", object.ID, "account", object.AccountID, "collection", object.Collection, "error", s.cleanError(err))
 			if resetErr := s.catalog.SetCollectionSync(ctx, object.CollectionID, ""); resetErr != nil {
 				return resetErr
 			}
@@ -128,7 +128,7 @@ func (s *Service) recoverSidecars(ctx context.Context) error {
 		s.logger.Warn("recovered message metadata missing after an incomplete commit", "sidecars", len(recovered))
 	}
 	for _, problem := range problems {
-		s.logger.Warn("could not recover missing message metadata", "error", problem)
+		s.logger.Warn("could not recover missing message metadata", "error", s.cleanError(problem))
 	}
 	return nil
 }

@@ -3,7 +3,7 @@ package run
 import "testing"
 
 func TestOperations(t *testing.T) {
-	for _, operation := range []Operation{OperationBackup, OperationVerify, OperationRestore} {
+	for _, operation := range []Operation{OperationBackup, OperationVerify, OperationRestore, OperationExport} {
 		if !operation.Valid() {
 			t.Errorf("operation %q is not valid", operation)
 		}

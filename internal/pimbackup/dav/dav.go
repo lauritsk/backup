@@ -4,7 +4,6 @@ package dav
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -18,9 +17,10 @@ import (
 	"github.com/emersion/go-webdav"
 	"github.com/emersion/go-webdav/caldav"
 	"github.com/emersion/go-webdav/carddav"
-	"github.com/google/uuid"
+	"uuid"
 
 	"github.com/lauritsk/backup/internal/pimbackup/config"
+	"github.com/lauritsk/backup/internal/tlsconfig"
 )
 
 var (
@@ -43,6 +43,9 @@ type Client struct {
 // New discovers an endpoint when account.URL is empty. An explicit URL is an
 // override and may point at a service root, collection home, or collection.
 func New(ctx context.Context, account config.AccountConfig) (*Client, error) {
+	if account.InsecureSkipVerify && !account.AllowInsecure {
+		return nil, errors.New("insecure_skip_verify requires allow_insecure = true")
+	}
 	endpoint, err := discoverEndpoint(ctx, account)
 	if err != nil {
 		return nil, err
@@ -51,8 +54,15 @@ func New(ctx context.Context, account config.AccountConfig) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse DAV endpoint: %w", err)
 	}
+	if parsed.Scheme != "https" && !account.AllowInsecure {
+		return nil, errors.New("an HTTP url requires allow_insecure = true")
+	}
+	tlsClientConfig, err := tlsconfig.Client("", account.CAFile, account.InsecureSkipVerify)
+	if err != nil {
+		return nil, fmt.Errorf("configure DAV TLS: %w", err)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: account.InsecureSkipVerify}
+	transport.TLSClientConfig = tlsClientConfig
 	httpClient := &http.Client{Timeout: account.Timeout.Duration, Transport: transport}
 	httpClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		if len(via) > 0 && via[0].Method == http.MethodPut {
@@ -64,10 +74,13 @@ func New(ctx context.Context, account config.AccountConfig) (*Client, error) {
 		if parsed.Scheme == "https" && request.URL.Scheme != "https" {
 			return errors.New("refusing DAV HTTPS downgrade")
 		}
+		if !sameOrigin(parsed, request.URL) {
+			return errors.New("refusing DAV redirect to another origin")
+		}
 		setAuth(request, account)
 		return nil
 	}
-	authenticated := authenticatedClient{client: httpClient, account: account}
+	authenticated := authenticatedClient{client: httpClient, account: account, origin: parsed}
 	wc, err := webdav.NewClient(authenticated, endpoint)
 	if err != nil {
 		return nil, err
@@ -227,9 +240,13 @@ func (c *Client) Objects(ctx context.Context, collection Collection) ([]Object, 
 // syncCollection uses RFC 6578 directly for both CardDAV and CalDAV. The
 // go-webdav release used here exposes this operation only through CardDAV.
 func (c *Client) syncCollection(ctx context.Context, collection Collection) ([]Object, string, bool, error) {
+	target, err := url.Parse(collection.URL)
+	if err != nil || !sameOrigin(c.endpoint, target) {
+		return nil, "", false, errors.New("refusing to send DAV credentials to another origin")
+	}
 	body := `<?xml version="1.0" encoding="utf-8"?><d:sync-collection xmlns:d="DAV:"><d:sync-token>` +
 		xmlEscape(collection.SyncToken) + `</d:sync-token><d:sync-level>1</d:sync-level><d:prop><d:getetag/><d:getcontenttype/></d:prop></d:sync-collection>`
-	request, err := http.NewRequestWithContext(ctx, "REPORT", collection.URL, bytes.NewBufferString(body))
+	request, err := http.NewRequestWithContext(ctx, "REPORT", target.String(), bytes.NewBufferString(body))
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -307,11 +324,31 @@ func xmlEscape(value string) string {
 }
 
 func (c *Client) Get(ctx context.Context, object Object) (io.ReadCloser, string, error) {
-	body, err := c.webdav.Open(ctx, object.RemoteID)
+	objectURL := object.URL
+	if objectURL == "" {
+		objectURL = c.resolve(object.RemoteID)
+	}
+	target, err := url.Parse(objectURL)
+	if err != nil || !sameOrigin(c.endpoint, target) {
+		return nil, "", errors.New("refusing to send DAV credentials to another origin")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, "", err
 	}
+	setAuth(request, c.account)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, "", err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		response.Body.Close()
+		return nil, "", fmt.Errorf("DAV download returned HTTP %d", response.StatusCode)
+	}
 	contentType := object.ContentType
+	if contentType == "" {
+		contentType = response.Header.Get("Content-Type")
+	}
 	if contentType == "" {
 		if c.account.Protocol == "carddav" {
 			contentType = "text/vcard"
@@ -319,7 +356,7 @@ func (c *Client) Get(ctx context.Context, object Object) (io.ReadCloser, string,
 			contentType = "text/calendar"
 		}
 	}
-	return body, contentType, nil
+	return response.Body, contentType, nil
 }
 
 // Put sends the archived bytes unchanged. The typed DAV helpers re-encode
@@ -344,6 +381,9 @@ func (c *Client) Put(ctx context.Context, collectionURL, kind, contentType strin
 		} else {
 			contentType = "text/vcard"
 		}
+	}
+	if !sameOrigin(c.endpoint, request.URL) {
+		return "", errors.New("refusing DAV restore to another origin")
 	}
 	request.Header.Set("Content-Type", contentType)
 	if seeker, ok := body.(io.Seeker); ok {
@@ -396,14 +436,22 @@ func samePath(left, right string) bool {
 type authenticatedClient struct {
 	client  *http.Client
 	account config.AccountConfig
+	origin  *url.URL
 }
 
 func (c authenticatedClient) Do(request *http.Request) (*http.Response, error) {
+	if !sameOrigin(c.origin, request.URL) {
+		return nil, errors.New("refusing to send DAV credentials to another origin")
+	}
 	clone := request.Clone(request.Context())
 	clone.Header = request.Header.Clone()
 	setAuth(clone, c.account)
 	return c.client.Do(clone)
 }
+func sameOrigin(first, second *url.URL) bool {
+	return first != nil && second != nil && strings.EqualFold(first.Scheme, second.Scheme) && strings.EqualFold(first.Host, second.Host) && first.User == nil && second.User == nil
+}
+
 func setAuth(request *http.Request, account config.AccountConfig) {
 	if account.Auth == "bearer" {
 		request.Header.Set("Authorization", "Bearer "+account.ResolvedToken)

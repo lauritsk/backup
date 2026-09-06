@@ -34,7 +34,7 @@ func newFileStore(dataDir string) (*fileStore, error) {
 		return nil, err
 	}
 	store := &fileStore{dataDir: dataDir, root: root}
-	for _, name := range []string{"recovery-points", "staging", "restores", "restic"} {
+	for _, name := range []string{"recovery-points", "staging", "exports", "restic"} {
 		if err := store.secureDirectory(name); err != nil {
 			root.Close()
 			return nil, err
@@ -112,11 +112,11 @@ func (s *fileStore) prepareDumpDir(staging string) error {
 	}
 	return s.secureDirectory(relative)
 }
-func (s *fileStore) restoreDir(runID, pointID string) (string, error) {
+func (s *fileStore) exportDir(runID, pointID string) (string, error) {
 	if !safeID.MatchString(runID) || !safeID.MatchString(pointID) {
 		return "", errors.New("invalid recovery point ID")
 	}
-	absolute := filepath.Join(s.dataDir, "restores", runID, pointID)
+	absolute := filepath.Join(s.dataDir, "exports", runID, pointID)
 	relative, err := s.relative(absolute)
 	if err != nil {
 		return "", err

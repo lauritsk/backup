@@ -1,0 +1,12 @@
+{
+  "restic": {},
+  "applications": [
+    {
+      "id": "cloud-documents",
+      "paths": [
+        "/var/lib/cloud-mirror/documents"
+      ],
+      "verify_after_backup": true
+    }
+  ]
+}

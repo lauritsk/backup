@@ -1,4 +1,4 @@
-// Package run defines operation and status values shared by the three tools.
+// Package run defines operation and status values shared by the backup tools.
 package run
 
 import "time"
@@ -11,12 +11,13 @@ const (
 	OperationBackup  Operation = "backup"
 	OperationVerify  Operation = "verify"
 	OperationRestore Operation = "restore"
+	OperationExport  Operation = "export"
 )
 
 // Valid reports whether the operation belongs to the common contract.
 func (o Operation) Valid() bool {
 	switch o {
-	case OperationBackup, OperationVerify, OperationRestore:
+	case OperationBackup, OperationVerify, OperationRestore, OperationExport:
 		return true
 	default:
 		return false

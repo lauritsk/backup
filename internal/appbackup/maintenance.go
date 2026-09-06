@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/lauritsk/backup/internal/appbackup/model"
-	"github.com/lauritsk/backup/internal/safeerror"
 )
 
 func (s *Service) Check(ctx context.Context) model.CheckReport {
@@ -25,7 +24,7 @@ func (s *Service) Check(ctx context.Context) model.CheckReport {
 		started := time.Now()
 		err := action()
 		if err != nil {
-			appendCheck(name, "error", safeerror.Clean(err).Error(), started)
+			appendCheck(name, "error", s.cleanError(err), started)
 		} else {
 			appendCheck(name, "ok", "", started)
 		}
@@ -33,7 +32,7 @@ func (s *Service) Check(ctx context.Context) model.CheckReport {
 	run("storage", s.checkStorage)
 	run("sqlite", func() error { return s.catalog.QuickCheck(ctx) })
 	run("restic", func() error { _, err := s.restic.Version(ctx); return err })
-	run("restic_repository", func() error { return s.restic.Check(ctx) })
+	run("restic_repository", func() error { return s.restic.CheckRepository(ctx) })
 	for _, executable := range s.configExecutables() {
 		executable := executable
 		run(executable.name, func() error { _, err := exec.LookPath(executable.binary); return err })
@@ -47,11 +46,6 @@ func (s *Service) Check(ctx context.Context) model.CheckReport {
 				return s.databases.Check(checkCtx, database)
 			})
 		}
-	}
-	if s.config.Engine != nil {
-		started := time.Now()
-		appendCheck("engine_socket_privilege", "warning", "access to a container engine socket grants broad host privilege", started)
-		run("engine", func() error { return s.engine.Check(ctx, *s.config.Engine) })
 	}
 	return report
 }
@@ -67,30 +61,6 @@ func (s *Service) checkStorage() error {
 		return err
 	}
 	return errors.Join(file.Sync(), file.Close(), os.Remove(name))
-}
-func (s *Service) Ready(ctx context.Context) error {
-	if !s.initialized.Load() {
-		return errors.New("startup reconciliation is waiting for the operation lock")
-	}
-	if err := s.catalog.Ping(ctx); err != nil {
-		return err
-	}
-	if _, err := s.restic.Version(ctx); err != nil {
-		return err
-	}
-	for _, application := range s.config.EnabledApplications() {
-		for _, database := range application.Databases {
-			if _, err := s.databases.Version(ctx, database); err != nil {
-				return err
-			}
-		}
-	}
-	for _, executable := range s.configExecutables() {
-		if _, err := exec.LookPath(executable.binary); err != nil {
-			return err
-		}
-	}
-	return s.checkStorage()
 }
 
 type configuredExecutable struct{ name, binary string }

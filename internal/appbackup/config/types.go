@@ -10,51 +10,25 @@ const (
 type Duration = configutil.Duration
 
 type Config struct {
-	DataDir      string              `json:"data_dir"`
+	DataDir      string              `json:"data_dir,omitempty"`
 	Restic       ResticConfig        `json:"restic"`
-	Server       ServerConfig        `json:"server"`
-	Schedule     ScheduleConfig      `json:"schedule"`
-	Log          LogConfig           `json:"log"`
-	Engine       *EngineConfig       `json:"engine,omitempty"`
+	Log          LogConfig           `json:"log,omitempty"`
 	Applications []ApplicationConfig `json:"applications"`
 	SourcePath   string              `json:"-"`
 }
 
 type ResticConfig struct {
-	Binary           string   `json:"binary"`
-	Repository       string   `json:"repository"`
-	Password         *string  `json:"password,omitempty"`
-	PasswordFile     *string  `json:"password_file,omitempty"`
-	ResolvedPassword string   `json:"-"`
-	Timeout          Duration `json:"timeout"`
-}
-
-type ServerConfig struct {
-	Listen               string   `json:"listen"`
-	ReadHeaderTimeout    Duration `json:"read_header_timeout"`
-	ReadTimeout          Duration `json:"read_timeout"`
-	IdleTimeout          Duration `json:"idle_timeout"`
-	ShutdownTimeout      Duration `json:"shutdown_timeout"`
-	AuthToken            *string  `json:"auth_token,omitempty"`
-	AuthTokenFile        *string  `json:"auth_token_file,omitempty"`
-	AllowUnauthenticated bool     `json:"allow_unauthenticated"`
-	ResolvedAuthToken    string   `json:"-"`
-}
-
-type ScheduleConfig struct {
-	Enabled    bool     `json:"enabled"`
-	Interval   Duration `json:"interval"`
-	RunOnStart bool     `json:"run_on_start"`
+	Binary               string   `json:"binary,omitempty"`
+	Password             *string  `json:"password,omitempty"`
+	PasswordFile         *string  `json:"password_file,omitempty"`
+	ResolvedPassword     string   `json:"-"`
+	ResolvedPasswordFile string   `json:"-"`
+	Timeout              Duration `json:"timeout,omitempty"`
 }
 
 type LogConfig struct {
 	Level  string `json:"level"`
 	Format string `json:"format"`
-}
-
-type EngineConfig struct {
-	Type   string `json:"type"`
-	Socket string `json:"socket"`
 }
 
 type ApplicationConfig struct {
@@ -102,20 +76,21 @@ type CommandConfig struct {
 }
 
 type DatabaseConfig struct {
-	ID               string         `json:"id"`
-	Type             string         `json:"type"`
-	Binary           string         `json:"binary,omitempty"`
-	RestoreBinary    string         `json:"restore_binary,omitempty"`
-	Host             string         `json:"host,omitempty"`
-	Port             int            `json:"port,omitempty"`
-	User             string         `json:"user,omitempty"`
-	Name             string         `json:"name,omitempty"`
-	Path             string         `json:"path,omitempty"`
-	Password         *string        `json:"password,omitempty"`
-	PasswordFile     *string        `json:"password_file,omitempty"`
-	VerifyCommand    *CommandConfig `json:"verify_command,omitempty"`
-	Timeout          Duration       `json:"timeout"`
-	ResolvedPassword string         `json:"-"`
+	ID                   string         `json:"id"`
+	Type                 string         `json:"type"`
+	Binary               string         `json:"binary,omitempty"`
+	RestoreBinary        string         `json:"restore_binary,omitempty"`
+	Host                 string         `json:"host,omitempty"`
+	Port                 int            `json:"port,omitempty"`
+	User                 string         `json:"user,omitempty"`
+	Name                 string         `json:"name,omitempty"`
+	Path                 string         `json:"path,omitempty"`
+	Password             *string        `json:"password,omitempty"`
+	PasswordFile         *string        `json:"password_file,omitempty"`
+	VerifyCommand        *CommandConfig `json:"verify_command,omitempty"`
+	Timeout              Duration       `json:"timeout"`
+	ResolvedPassword     string         `json:"-"`
+	ResolvedPasswordFile string         `json:"-"`
 }
 
-type Overrides struct{ ConfigPath, Listen, LogLevel, LogFormat *string }
+type Overrides struct{ ConfigPath, DataDir, LogLevel, LogFormat *string }

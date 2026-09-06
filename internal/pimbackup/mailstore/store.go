@@ -38,6 +38,7 @@ const (
 type Store struct {
 	dataDir     string
 	accountsDir string
+	root        *os.Root
 }
 
 type MailboxMetadata struct {
@@ -106,8 +107,14 @@ func New(dataDir string) (*Store, error) {
 	if err := ensurePrivateDirectories(dataDir, accountsDir); err != nil {
 		return nil, fmt.Errorf("create accounts directory: %w", err)
 	}
-	return &Store{dataDir: dataDir, accountsDir: accountsDir}, nil
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("open mail store root: %w", err)
+	}
+	return &Store{dataDir: dataDir, accountsDir: accountsDir, root: root}, nil
 }
+
+func (s *Store) Close() error { return s.root.Close() }
 
 func (s *Store) DataDir() string {
 	return s.dataDir
@@ -376,20 +383,21 @@ func (s *Store) Resolve(relative string) (string, error) {
 }
 
 func (s *Store) OpenMessage(message model.Message) (*os.File, error) {
-	filename, err := s.Resolve(message.Path)
-	if err != nil {
+	if _, err := s.Resolve(message.Path); err != nil {
 		return nil, err
 	}
-	info, err := os.Lstat(filename)
+	file, err := s.root.Open(filepath.ToSlash(message.Path))
 	if err != nil {
+		return nil, fmt.Errorf("open message file: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
 		return nil, fmt.Errorf("inspect message file: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("message path %s is not a regular file", filename)
-	}
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, fmt.Errorf("open message file: %w", err)
+		file.Close()
+		return nil, errors.New("message path is not a regular file")
 	}
 	return file, nil
 }

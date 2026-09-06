@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"sort"
+	"sync"
 
 	"github.com/lauritsk/backup/internal/pimbackup/catalog"
 	"github.com/lauritsk/backup/internal/pimbackup/config"
@@ -20,6 +22,11 @@ import (
 type remoteCollection struct {
 	Name, RemoteID, URL, SyncToken, Kind string
 }
+
+const (
+	imapBatchSize   = 10
+	objectTransfers = 4
+)
 
 type remoteObject struct {
 	RemoteID, BlobID, URL, ETag, ContentType string
@@ -168,7 +175,7 @@ func (s *Service) backupAccount(ctx context.Context, account config.AccountConfi
 func (s *Service) backupIMAPAccount(ctx context.Context, account config.AccountConfig) (result model.AccountBackupResult) {
 	result.AccountID = account.ID
 	if err := s.catalog.UpsertAccount(ctx, account.ID, account.Protocol); err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return
 	}
 	if account.ResolvedPassword == "" {
@@ -177,24 +184,24 @@ func (s *Service) backupIMAPAccount(ctx context.Context, account config.AccountC
 	}
 	remote, err := s.dialer.Dial(ctx, account)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return
 	}
 	defer func() {
 		if closeErr := remote.Close(); closeErr != nil && result.Error == "" {
-			result.Error = "close IMAP connection: " + closeErr.Error()
+			result.Error = s.cleanError(fmt.Errorf("close IMAP connection: %w", closeErr))
 		}
 	}()
 
 	mailboxes, err := remote.ListMailboxes(ctx)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return
 	}
 	selectedMailboxes := 0
 	for _, remoteMailbox := range mailboxes {
 		if err := ctx.Err(); err != nil {
-			result.Error = err.Error()
+			result.Error = s.cleanError(err)
 			return
 		}
 		if !remoteMailbox.Selectable || !selected(remoteMailbox.Name, account.Mailboxes, account.ExcludeMailboxes) {
@@ -215,18 +222,18 @@ func (s *Service) backupIMAPAccount(ctx context.Context, account config.AccountC
 func (s *Service) backupObjectAccount(ctx context.Context, account config.AccountConfig) (result model.AccountBackupResult) {
 	result.AccountID = account.ID
 	if err := s.catalog.UpsertAccount(ctx, account.ID, account.Protocol); err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return
 	}
 	source, err := newObjectSource(ctx, account)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return
 	}
 	defer source.Close()
 	collections, err := source.Collections(ctx)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return
 	}
 	for _, remote := range collections {
@@ -252,55 +259,137 @@ func (s *Service) backupObjectCollection(ctx context.Context, account config.Acc
 	entry.Collection, entry.Kind = remote.Name, remote.Kind
 	collection, err := s.catalog.EnsureCollection(ctx, model.Collection{AccountID: account.ID, Kind: remote.Kind, Name: remote.Name, RemoteID: remote.RemoteID, RemoteURL: remote.URL, SyncToken: remote.SyncToken})
 	if err != nil {
-		entry.Error = err.Error()
+		entry.Error = s.cleanError(err)
 		return
 	}
 	remote.SyncToken = collection.SyncToken
 	objects, token, err := source.Objects(ctx, remote)
 	if err != nil {
-		entry.Error = err.Error()
+		entry.Error = s.cleanError(err)
 		return
 	}
 	entry.Found = len(objects)
-	for _, remoteObject := range objects {
+	pending := make([]remoteObject, 0, len(objects))
+	for _, object := range objects {
 		if err := ctx.Err(); err != nil {
-			entry.Error = err.Error()
+			entry.Error = s.cleanError(err)
 			break
 		}
-		existing, lookupErr := s.catalog.GetObjectByRemoteID(ctx, collection.ID, remoteObject.RemoteID)
-		if lookupErr == nil && remoteObject.ComparableETag && existing.ETag == remoteObject.ETag {
+		existing, lookupErr := s.catalog.GetObjectByRemoteID(ctx, collection.ID, object.RemoteID)
+		if lookupErr == nil && object.ComparableETag && existing.ETag == object.ETag {
 			if verifyErr := s.objectStore.BasicCheck(existing); verifyErr == nil {
 				continue
 			}
 		} else if lookupErr != nil && !errors.Is(lookupErr, catalog.ErrNotFound) {
-			entry.Error = lookupErr.Error()
+			entry.Error = s.cleanError(lookupErr)
 			break
 		}
-		body, contentType, getErr := source.Get(ctx, remoteObject)
-		if getErr != nil {
-			entry.Error = getErr.Error()
-			break
+		pending = append(pending, object)
+	}
+	if entry.Error == "" {
+		fetched, bytes, fetchErr := s.fetchObjects(ctx, source, collection, pending)
+		entry.Fetched, entry.Bytes = fetched, bytes
+		if fetchErr != nil {
+			entry.Error = s.cleanError(fetchErr)
 		}
-		saved, saveErr := s.objectStore.Save(ctx, collection, remoteObject.RemoteID, remoteObject.ETag, contentType, remoteObject.Attributes, body)
-		saveErr = errors.Join(saveErr, body.Close())
-		if saveErr != nil {
-			entry.Error = saveErr.Error()
-			break
-		}
-		stored, putErr := s.catalog.PutObject(ctx, saved.Object)
-		if putErr != nil {
-			entry.Error = putErr.Error()
-			break
-		}
-		entry.Fetched++
-		entry.Bytes += stored.Size
 	}
 	if entry.Error == "" {
 		if err := s.setCollectionSync(ctx, collection, token); err != nil {
-			entry.Error = err.Error()
+			entry.Error = s.cleanError(err)
 		}
 	}
 	return
+}
+
+type objectFetchTask struct {
+	index  int
+	object remoteObject
+}
+
+type objectFetchResult struct {
+	index    int
+	object   model.Object
+	received bool
+	err      error
+}
+
+func (s *Service) fetchObjects(ctx context.Context, source objectSource, collection model.Collection, objects []remoteObject) (int, int64, error) {
+	if len(objects) == 0 {
+		return 0, 0, nil
+	}
+	workers := objectTransfers
+	if len(objects) < workers {
+		workers = len(objects)
+	}
+	jobs := make(chan objectFetchTask)
+	results := make(chan objectFetchResult, len(objects))
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			for task := range jobs {
+				result := s.fetchObject(ctx, source, collection, task.object)
+				result.index = task.index
+				result.received = true
+				results <- result
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for index, object := range objects {
+			select {
+			case jobs <- objectFetchTask{index: index, object: object}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		group.Wait()
+		close(results)
+	}()
+
+	ordered := make([]objectFetchResult, len(objects))
+	for result := range results {
+		ordered[result.index] = result
+	}
+	var fetched int
+	var bytes int64
+	var resultErr error
+	for _, result := range ordered {
+		if !result.received {
+			continue
+		}
+		if result.err != nil {
+			resultErr = errors.Join(resultErr, result.err)
+			continue
+		}
+		stored, err := s.catalog.PutObject(context.WithoutCancel(ctx), result.object)
+		if err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("catalog object %q: %w", result.object.RemoteID, err))
+			continue
+		}
+		fetched++
+		bytes += stored.Size
+	}
+	if err := ctx.Err(); err != nil {
+		resultErr = errors.Join(resultErr, err)
+	}
+	return fetched, bytes, resultErr
+}
+
+func (s *Service) fetchObject(ctx context.Context, source objectSource, collection model.Collection, object remoteObject) objectFetchResult {
+	body, contentType, err := source.Get(ctx, object)
+	if err != nil {
+		return objectFetchResult{err: fmt.Errorf("download object %q: %w", object.RemoteID, err)}
+	}
+	saved, saveErr := s.objectStore.Save(ctx, collection, object.RemoteID, object.ETag, contentType, object.Attributes, body)
+	if err := errors.Join(saveErr, body.Close()); err != nil {
+		return objectFetchResult{err: fmt.Errorf("store object %q: %w", object.RemoteID, err)}
+	}
+	return objectFetchResult{object: saved.Object}
 }
 
 func (s *Service) setCollectionSync(ctx context.Context, collection model.Collection, token string) error {
@@ -348,7 +437,7 @@ func (s *Service) backupMailbox(ctx context.Context, account config.AccountConfi
 	result := model.MailboxBackupResult{Mailbox: remoteMailbox.Name}
 	selectedMailbox, err := remote.SelectMailbox(ctx, remoteMailbox.Name)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return result
 	}
 	result.UIDValidity = selectedMailbox.UIDValidity
@@ -358,43 +447,50 @@ func (s *Service) backupMailbox(ctx context.Context, account config.AccountConfi
 		UIDValidity: selectedMailbox.UIDValidity, RemoteMessages: selectedMailbox.Messages,
 	})
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return result
 	}
 	if _, err := s.store.PrepareMailbox(mailbox); err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return result
 	}
 
 	uids, err := remote.SearchUIDsAfter(ctx, mailbox.LastUID)
 	if err != nil {
-		result.Error = err.Error()
+		result.Error = s.cleanError(err)
 		return result
 	}
 	result.Found = len(uids)
-	for _, uid := range uids {
+	for start := 0; start < len(uids); start += imapBatchSize {
 		if err := ctx.Err(); err != nil {
-			result.Error = err.Error()
+			result.Error = s.cleanError(err)
 			return result
 		}
-		var saved mailstore.SavedMessage
-		err := remote.FetchMessage(ctx, uid, func(fetched imapbackup.FetchedMessage, body io.Reader) error {
-			var saveErr error
-			saved, saveErr = s.store.Save(ctx, mailbox, mailstore.FetchedMessage{UID: fetched.UID, InternalDate: fetched.InternalDate, Flags: fetched.Flags, ExpectedSize: fetched.Size, Body: body})
-			return saveErr
+		end := min(start+imapBatchSize, len(uids))
+		savedMessages := make([]mailstore.SavedMessage, 0, end-start)
+		fetchErr := remote.FetchMessages(ctx, uids[start:end], func(fetched imapbackup.FetchedMessage, body io.Reader) error {
+			saved, err := s.store.Save(ctx, mailbox, mailstore.FetchedMessage{UID: fetched.UID, InternalDate: fetched.InternalDate, Flags: fetched.Flags, ExpectedSize: fetched.Size, Body: body})
+			if err == nil {
+				savedMessages = append(savedMessages, saved)
+			}
+			return err
 		})
-		if err != nil {
-			result.Error = err.Error()
+		sort.Slice(savedMessages, func(left, right int) bool { return savedMessages[left].Message.UID < savedMessages[right].Message.UID })
+		var catalogErr error
+		for _, saved := range savedMessages {
+			stored, err := s.catalog.PutMessage(context.WithoutCancel(ctx), saved.Message)
+			if err != nil {
+				catalogErr = errors.Join(catalogErr, err)
+				continue
+			}
+			result.Fetched++
+			result.Bytes += stored.Size
+			s.logger.Debug("archived IMAP message", "account", account.ID, "mailbox", remoteMailbox.Name, "uid_validity", selectedMailbox.UIDValidity, "uid", saved.Message.UID, "bytes", stored.Size, "created", saved.Created)
+		}
+		if err := errors.Join(fetchErr, catalogErr); err != nil {
+			result.Error = s.cleanError(err)
 			return result
 		}
-		stored, err := s.catalog.PutMessage(ctx, saved.Message)
-		if err != nil {
-			result.Error = err.Error()
-			return result
-		}
-		result.Fetched++
-		result.Bytes += stored.Size
-		s.logger.Debug("archived IMAP message", "account", account.ID, "mailbox", remoteMailbox.Name, "uid_validity", selectedMailbox.UIDValidity, "uid", uid, "bytes", stored.Size, "created", saved.Created)
 	}
 	return result
 }

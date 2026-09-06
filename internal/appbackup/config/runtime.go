@@ -1,7 +1,5 @@
 package config
 
-import "path/filepath"
-
 func (cfg Config) EnabledApplications() []ApplicationConfig {
 	var result []ApplicationConfig
 	for _, app := range cfg.Applications {
@@ -17,23 +15,7 @@ func (cfg Config) EffectiveVerificationCommand(database DatabaseConfig) *Command
 	}
 	command := *database.VerifyCommand
 	command.Args = append([]string(nil), command.Args...)
-	engineType := containerEngineType(command.Binary)
-	if engineType == "" || cfg.Engine == nil || cfg.Engine.Type != engineType {
-		return &command
-	}
-	option := "--host"
-	if engineType == "podman" {
-		option = "--url"
-	}
-	command.Args = append([]string{option, "unix://" + cfg.Engine.Socket}, command.Args...)
 	return &command
-}
-func containerEngineType(binary string) string {
-	name := filepath.Base(binary)
-	if name == "docker" || name == "podman" {
-		return name
-	}
-	return ""
 }
 
 func (cfg Config) Application(id string) (ApplicationConfig, bool) {
@@ -52,14 +34,9 @@ func (cfg Config) RedactedCopy() Config {
 	} else {
 		result.Restic.Password = nil
 	}
-	result.Restic.PasswordFile, result.Restic.ResolvedPassword = nil, ""
-	result.Server = cfg.Server
-	if cfg.Server.ResolvedAuthToken != "" {
-		result.Server.AuthToken = pointer(Redacted)
-	} else {
-		result.Server.AuthToken = nil
-	}
-	result.Server.AuthTokenFile, result.Server.ResolvedAuthToken = nil, ""
+	result.Restic.PasswordFile = nil
+	result.Restic.ResolvedPassword = ""
+	result.Restic.ResolvedPasswordFile = ""
 	result.Applications = append([]ApplicationConfig(nil), cfg.Applications...)
 	for i := range result.Applications {
 		result.Applications[i].Databases = append([]DatabaseConfig(nil), cfg.Applications[i].Databases...)
@@ -70,7 +47,9 @@ func (cfg Config) RedactedCopy() Config {
 			} else {
 				database.Password = nil
 			}
-			database.PasswordFile, database.ResolvedPassword = nil, ""
+			database.PasswordFile = nil
+			database.ResolvedPassword = ""
+			database.ResolvedPasswordFile = ""
 		}
 	}
 	return result

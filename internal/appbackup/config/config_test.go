@@ -33,6 +33,12 @@ func TestLoadValidateAndRedact(t *testing.T) {
 	}
 }
 
+func TestDefaultsUseTextLogs(t *testing.T) {
+	if got := defaults().Log.Format; got != "text" {
+		t.Fatalf("default log format = %q", got)
+	}
+}
+
 func TestNormalizeOnlyConfiguresRequiredDatabaseClients(t *testing.T) {
 	cfg := defaults()
 	cfg.Applications = []ApplicationConfig{{Databases: []DatabaseConfig{
@@ -63,7 +69,7 @@ func TestValidateDatabaseDoesNotRequireSQLiteOrMySQLRestoreBinaries(t *testing.T
 		{ID: "sqlite", Type: "sqlite", Path: "/srv/app.sqlite", Timeout: minute},
 		{ID: "mysql", Type: "mysql", Binary: "mysqldump", Name: "app", Timeout: minute},
 	} {
-		if err := validateDatabase(database); err != nil {
+		if err := validateDatabase("/data", database); err != nil {
 			t.Fatalf("validateDatabase(%s): %v", database.Type, err)
 		}
 	}
@@ -78,14 +84,12 @@ func TestValidateRejectsPathOverlappingData(t *testing.T) {
 	}
 }
 
-func TestEffectiveVerificationCommandUsesConfiguredEngine(t *testing.T) {
-	cfg := Config{Engine: &EngineConfig{Type: "docker", Socket: "/run/docker.sock"}}
-	database := DatabaseConfig{VerifyCommand: &CommandConfig{Binary: "docker", Args: []string{"run", "{dump}"}}}
+func TestEffectiveVerificationCommandReturnsIndependentCopy(t *testing.T) {
+	cfg := Config{}
+	database := DatabaseConfig{VerifyCommand: &CommandConfig{Binary: "verify-dump", Args: []string{"{dump}"}}}
 	command := cfg.EffectiveVerificationCommand(database)
-	if command.Binary != "docker" || strings.Join(command.Args, " ") != "--host unix:///run/docker.sock run {dump}" {
-		t.Fatalf("effective command = %#v", command)
-	}
-	if database.VerifyCommand.Binary != "docker" || len(database.VerifyCommand.Args) != 2 {
+	command.Args[0] = "changed"
+	if database.VerifyCommand.Args[0] != "{dump}" {
 		t.Fatal("effective command mutated configuration")
 	}
 }

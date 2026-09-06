@@ -31,6 +31,7 @@ func (f *fakeRestic) Version(context.Context) (string, error) {
 	return "restic 1.0", nil
 }
 func (f *fakeRestic) EnsureRepository(context.Context) error { f.add("restic-init"); return nil }
+func (f *fakeRestic) CheckRepository(context.Context) error  { f.add("restic-repository"); return nil }
 func (f *fakeRestic) Check(context.Context) error            { f.add("restic-check"); return nil }
 func (f *fakeRestic) Backup(_ context.Context, paths, tags []string) (string, error) {
 	f.add("restic-backup")
@@ -74,6 +75,7 @@ func (f *fakeRestic) Restore(_ context.Context, snapshot, target string) error {
 	return nil
 }
 func (f *fakeRestic) List(_ context.Context, snapshot string, limit, offset int) ([]string, error) {
+	f.add("restic-list")
 	var result []string
 	for path := range f.snapshots[snapshot] {
 		result = append(result, path)
@@ -136,7 +138,7 @@ func serviceConfig(dataDir, source string) config.Config {
 	minute := config.Duration{Duration: time.Minute}
 	return config.Config{
 		DataDir: dataDir,
-		Restic:  config.ResticConfig{Binary: "restic", Repository: filepath.Join(dataDir, "restic"), ResolvedPassword: "secret"},
+		Restic:  config.ResticConfig{Binary: "restic", ResolvedPassword: "secret"},
 		Applications: []config.ApplicationConfig{{
 			ID: "site", Paths: []string{source}, Timeout: config.Duration{Duration: time.Hour}, VerifyAfterBackup: true,
 			Databases: []config.DatabaseConfig{{ID: "db", Type: "postgresql", Timeout: minute}},
@@ -150,7 +152,7 @@ func serviceConfig(dataDir, source string) config.Config {
 	}
 }
 
-func TestBackupVerifyBrowseAndRestoreRoundTrip(t *testing.T) {
+func TestBackupVerifyBrowseAndExportRoundTrip(t *testing.T) {
 	dataDir, source := t.TempDir(), filepath.Join(t.TempDir(), "files")
 	if err := os.MkdirAll(source, 0o700); err != nil {
 		t.Fatal(err)
@@ -194,19 +196,19 @@ func TestBackupVerifyBrowseAndRestoreRoundTrip(t *testing.T) {
 	if err != nil || verifyRun.Status != runmodel.StatusSucceeded {
 		t.Fatalf("verify = %#v, %v", verifyRun, err)
 	}
-	restoreRun, err := service.Restore(context.Background(), model.RestoreRequest{RecoveryPointID: point.ID, Confirm: true})
+	exportRun, err := service.Export(context.Background(), model.ExportRequest{RecoveryPointID: point.ID, Confirm: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var report model.RestoreReport
-	if err := json.Unmarshal(restoreRun.Detail, &report); err != nil {
+	var report model.ExportReport
+	if err := json.Unmarshal(exportRun.Detail, &report); err != nil {
 		t.Fatal(err)
 	}
-	restored := filepath.Join(report.Directory, strings.TrimPrefix(source, string(filepath.Separator)), "content.txt")
-	if contents, err := os.ReadFile(restored); err != nil || string(contents) != "application data" {
-		t.Fatalf("restored = %q, %v", contents, err)
+	exported := filepath.Join(report.Directory, strings.TrimPrefix(source, string(filepath.Separator)), "content.txt")
+	if contents, err := os.ReadFile(exported); err != nil || string(contents) != "application data" {
+		t.Fatalf("exported = %q, %v", contents, err)
 	}
-	wantOrder := []string{"restic-init", "restic-version", "pre", "freeze", "database-version", "database-dump", "restic-backup", "thaw", "post", "restic-check", "restic-restore", "database-verify"}
+	wantOrder := []string{"restic-init", "restic-version", "pre", "freeze", "database-version", "database-dump", "restic-backup", "thaw", "post", "restic-list", "restic-restore", "database-verify", "restic-list", "restic-check", "restic-list", "restic-restore", "database-verify", "restic-restore"}
 	if strings.Join(events[:len(wantOrder)], ",") != strings.Join(wantOrder, ",") {
 		t.Fatalf("events = %#v", events)
 	}

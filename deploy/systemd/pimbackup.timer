@@ -1,0 +1,11 @@
+[Unit]
+Description=Run PIM Backup daily
+
+[Timer]
+OnCalendar=daily
+Persistent=yes
+RandomizedDelaySec=30m
+Unit=pimbackup.service
+
+[Install]
+WantedBy=timers.target

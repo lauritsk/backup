@@ -1,0 +1,38 @@
+[Unit]
+Description=Create application recovery points
+Documentation=https://github.com/lauritsk/backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=backup
+Group=backup
+UMask=0077
+StateDirectory=appbackup
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/appbackup backup --config /etc/backup/appbackup.json --data-dir /var/lib/appbackup
+LoadCredential=restic-password:/etc/backup/credentials/restic-password
+Environment=APPBACKUP_RESTIC_PASSWORD_FILE=/run/credentials/appbackup.service/restic-password
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/appbackup
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

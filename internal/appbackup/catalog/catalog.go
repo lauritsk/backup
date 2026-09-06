@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
+	"uuid"
 
 	"github.com/lauritsk/backup/internal/appbackup/model"
 	runmodel "github.com/lauritsk/backup/internal/run"
@@ -20,7 +20,10 @@ import (
 
 var ErrNotFound = errors.New("catalog record not found")
 
-type Catalog struct{ db *sql.DB }
+type Catalog struct {
+	db      *sql.DB
+	created bool
+}
 type Run struct {
 	runmodel.Record
 	Detail json.RawMessage `json:"detail,omitempty"`
@@ -38,9 +41,12 @@ func Open(ctx context.Context, dataDir string) (*Catalog, error) {
 		return nil, err
 	}
 	path := filepath.Join(dataDir, "app.db")
+	created := false
 	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("catalog path %s is not a regular file", path)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	} else if err == nil {
+		created = info.Size() == 0
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	} else if errors.Is(err, os.ErrNotExist) {
 		file, createErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
@@ -48,6 +54,7 @@ func Open(ctx context.Context, dataDir string) (*Catalog, error) {
 			return nil, fmt.Errorf("create catalog: %w", createErr)
 		}
 		if createErr == nil {
+			created = true
 			if closeErr := file.Close(); closeErr != nil {
 				return nil, closeErr
 			}
@@ -62,7 +69,7 @@ func Open(ctx context.Context, dataDir string) (*Catalog, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	catalog := &Catalog{db: db}
+	catalog := &Catalog{db: db, created: created}
 	if err := catalog.initialize(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -87,6 +94,7 @@ func (c *Catalog) initialize(ctx context.Context) error {
 }
 
 func (c *Catalog) Close() error                   { return c.db.Close() }
+func (c *Catalog) Created() bool                  { return c.created }
 func (c *Catalog) Ping(ctx context.Context) error { return c.db.PingContext(ctx) }
 func (c *Catalog) QuickCheck(ctx context.Context) error {
 	var value string
@@ -101,6 +109,21 @@ func (c *Catalog) QuickCheck(ctx context.Context) error {
 func (c *Catalog) UpsertApplication(ctx context.Context, id string) error {
 	_, err := c.db.ExecContext(ctx, `INSERT INTO applications(id,updated_at) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at`, id, formatTime(time.Now()))
 	return err
+}
+
+func (c *Catalog) PrepareRebuild(ctx context.Context) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM recovery_points`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM applications`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (c *Catalog) ApplyRecoveryPoint(ctx context.Context, point model.RecoveryPoint, manifestPath string) error {
@@ -178,7 +201,7 @@ func (c *Catalog) ListRecoveryPoints(ctx context.Context, application string, li
 	}
 	return result, rows.Err()
 }
-func (c *Catalog) AllRecoveryPoints(ctx context.Context, id string) ([]model.RecoveryPointSummary, error) {
+func (c *Catalog) RecoveryPointsForVerification(ctx context.Context, id, application string, all bool) ([]model.RecoveryPointSummary, error) {
 	if id != "" {
 		point, err := c.GetRecoveryPoint(ctx, id)
 		if err != nil {
@@ -186,7 +209,18 @@ func (c *Catalog) AllRecoveryPoints(ctx context.Context, id string) ([]model.Rec
 		}
 		return []model.RecoveryPointSummary{point}, nil
 	}
-	rows, err := c.db.QueryContext(ctx, `SELECT id,application_id,status,started_at,completed_at,snapshot_id,verification_status,dump_count FROM recovery_points ORDER BY started_at DESC`)
+	query := `SELECT id,application_id,status,started_at,completed_at,snapshot_id,verification_status,dump_count FROM recovery_points`
+	if all {
+		query += ` WHERE snapshot_id<>'' AND (?='' OR application_id=?)`
+	} else {
+		query += ` AS current WHERE current.status='succeeded' AND current.snapshot_id<>'' AND (?='' OR current.application_id=?) AND current.id = (
+			SELECT candidate.id FROM recovery_points AS candidate
+			WHERE candidate.application_id=current.application_id AND candidate.status='succeeded' AND candidate.snapshot_id<>''
+			ORDER BY candidate.started_at DESC LIMIT 1
+		)`
+	}
+	query += ` ORDER BY started_at DESC`
+	rows, err := c.db.QueryContext(ctx, query, application, application)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +283,7 @@ func (c *Catalog) CreateRun(ctx context.Context, operation runmodel.Operation, r
 	if err != nil {
 		return Run{}, err
 	}
-	id, now := uuid.NewString(), formatTime(time.Now())
+	id, now := uuid.NewV7().String(), formatTime(time.Now())
 	_, err = c.db.ExecContext(ctx, `INSERT INTO runs(id,operation,status,requested_at,detail_json) VALUES(?,?,?,?,?)`, id, operation, runmodel.StatusQueued, now, string(detail))
 	if err != nil {
 		return Run{}, err

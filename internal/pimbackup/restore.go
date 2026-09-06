@@ -100,7 +100,7 @@ func (s *Service) restoreMessages(ctx context.Context, request model.RestoreRequ
 			return putErr
 		})
 		if restoreErr != nil {
-			entry.Error = restoreErr.Error()
+			entry.Error = s.cleanError(restoreErr)
 			report.Failed++
 		} else {
 			report.Restored++
@@ -140,7 +140,7 @@ func (s *Service) restoreObjects(ctx context.Context, request model.RestoreReque
 			return putErr
 		})
 		if restoreErr != nil {
-			entry.Error = restoreErr.Error()
+			entry.Error = s.cleanError(restoreErr)
 			report.Failed++
 		} else {
 			report.Restored++

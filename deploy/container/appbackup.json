@@ -1,0 +1,16 @@
+{
+  "data_dir": "/data",
+  "restic": {
+    "password_file": "/run/secrets/appbackup_restic_password"
+  },
+  "applications": [
+    {
+      "id": "example",
+      "paths": [
+        "/srv/example",
+        "/srv/cloud-mirror"
+      ],
+      "verify_after_backup": true
+    }
+  ]
+}

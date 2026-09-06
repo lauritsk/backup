@@ -1,0 +1,14 @@
+{
+  "restic": {
+    "password_file": "/run/credentials/appbackup.service/restic-password"
+  },
+  "applications": [
+    {
+      "id": "cloud-documents",
+      "paths": [
+        "/var/lib/cloud-mirror/documents"
+      ],
+      "verify_after_backup": true
+    }
+  ]
+}

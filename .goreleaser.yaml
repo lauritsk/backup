@@ -3,21 +3,27 @@
 version: 2
 
 builds:
-  - main: ./cmd/...
-    env:
+  - id: pimbackup
+    main: ./cmd/pimbackup
+    binary: pimbackup
+    env: &build-env
       - CGO_ENABLED=0
-    flags:
+    flags: &build-flags
       - -trimpath
-    ldflags:
+    ldflags: &build-ldflags
       - >-
         -s -w
         -X github.com/lauritsk/backup/internal/buildinfo.Version={{ .Version }}
         -X github.com/lauritsk/backup/internal/buildinfo.Revision={{ .Commit }}
         -X github.com/lauritsk/backup/internal/buildinfo.BuildTime={{ .CommitDate }}
-    mod_timestamp: "{{ .CommitTimestamp }}"
-
-gomod:
-  proxy: true
+    mod_timestamp: &build-timestamp "{{ .CommitTimestamp }}"
+  - id: appbackup
+    main: ./cmd/appbackup
+    binary: appbackup
+    env: *build-env
+    flags: *build-flags
+    ldflags: *build-ldflags
+    mod_timestamp: *build-timestamp
 
 archives:
   - wrap_in_directory: true

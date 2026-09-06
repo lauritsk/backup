@@ -7,10 +7,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/lauritsk/backup/internal/appbackup/config"
 	"github.com/lauritsk/backup/internal/appbackup/model"
-	"github.com/lauritsk/backup/internal/safeerror"
+	"uuid"
 )
 
 func (s *Service) backup(ctx context.Context, runID string, request model.BackupRequest) (model.BackupReport, error) {
@@ -24,16 +23,20 @@ func (s *Service) backup(ctx context.Context, runID string, request model.Backup
 	if err := s.restic.EnsureRepository(ctx); err != nil {
 		return model.BackupReport{}, err
 	}
+	resticVersion, err := s.restic.Version(ctx)
+	if err != nil {
+		return model.BackupReport{}, err
+	}
 	report := model.BackupReport{}
 	for _, application := range applications {
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
 		appCtx, cancel := context.WithTimeout(ctx, application.Timeout.Duration)
-		result, pointErr := s.backupApplication(appCtx, runID, application)
+		result, pointErr := s.backupApplication(appCtx, runID, application, resticVersion)
 		cancel()
 		if pointErr != nil {
-			result.Error = pointErr.Error()
+			result.Error = s.cleanError(pointErr)
 			report.Failed++
 		} else {
 			report.Succeeded++
@@ -46,11 +49,14 @@ func (s *Service) backup(ctx context.Context, runID string, request model.Backup
 	return report, nil
 }
 
-func (s *Service) backupApplication(ctx context.Context, runID string, application config.ApplicationConfig) (model.ApplicationBackupResult, error) {
-	point := model.RecoveryPoint{SchemaVersion: 1, ID: uuid.NewString(), RunID: runID, ApplicationID: application.ID, Status: "running", StartedAt: time.Now().UTC(), Paths: append([]string(nil), application.Paths...), ToolVersions: map[string]string{}}
+func (s *Service) backupApplication(ctx context.Context, runID string, application config.ApplicationConfig, resticVersion string) (model.ApplicationBackupResult, error) {
+	point := model.RecoveryPoint{SchemaVersion: 1, ID: uuid.NewV7().String(), RunID: runID, ApplicationID: application.ID, Status: "running", StartedAt: time.Now().UTC(), Paths: append([]string(nil), application.Paths...), ToolVersions: map[string]string{"restic": resticVersion}}
 	result := model.ApplicationBackupResult{ApplicationID: application.ID, RecoveryPointID: point.ID}
 	manifestPath, err := s.store.writeRecoveryPoint(point)
 	if err != nil {
+		return result, err
+	}
+	if err := s.catalog.ApplyRecoveryPoint(ctx, point, manifestPath); err != nil {
 		return result, err
 	}
 	staging, err := s.store.stagingDir(point.ID, application.ID)
@@ -59,17 +65,11 @@ func (s *Service) backupApplication(ctx context.Context, runID string, applicati
 	}
 	defer func() {
 		if err := s.store.removeStaging(point.ID); err != nil {
-			s.logger.Warn("could not remove recovery-point staging directory", "recovery_point_id", point.ID, "error", err)
+			s.logger.Warn("could not remove recovery-point staging directory", "recovery_point_id", point.ID, "error", s.cleanError(err))
 		}
 	}()
 	quiesceStarted := false
 	var operationErr error
-	version, err := s.restic.Version(ctx)
-	if err != nil {
-		operationErr = err
-	} else {
-		point.ToolVersions["restic"] = version
-	}
 	if operationErr == nil {
 		operationErr = s.runHookPhase(ctx, config.HookPreBackup, application.Hooks.PreBackup, &point)
 	}
@@ -82,7 +82,7 @@ func (s *Service) backupApplication(ctx context.Context, runID string, applicati
 			component := model.ComponentResult{ID: "database:" + database.ID, Type: "database:" + database.Type, Status: "running"}
 			dump, err := s.createDump(ctx, staging, database)
 			if err != nil {
-				component.Status, component.Error = "failed", safeerror.Clean(err).Error()
+				component.Status, component.Error = "failed", s.cleanError(err)
 				point.Components = append(point.Components, component)
 				operationErr = err
 				break
@@ -101,7 +101,7 @@ func (s *Service) backupApplication(ctx context.Context, runID string, applicati
 		point.SnapshotID, operationErr = s.restic.Backup(ctx, paths, []string{"appbackup", "application:" + application.ID, "recovery-point:" + point.ID})
 		result.SnapshotID = point.SnapshotID
 		if operationErr != nil {
-			component.Status, component.Error = "failed", safeerror.Clean(operationErr).Error()
+			component.Status, component.Error = "failed", s.cleanError(operationErr)
 		} else {
 			component.Status = "succeeded"
 		}
@@ -118,7 +118,7 @@ func (s *Service) backupApplication(ctx context.Context, runID string, applicati
 	point.Status = "succeeded"
 	if operationErr != nil {
 		point.Status = "failed"
-		point.Error = safeerror.Clean(operationErr).Error()
+		point.Error = s.cleanError(operationErr)
 	}
 	if _, err := s.store.writeRecoveryPoint(point); err != nil {
 		operationErr = errors.Join(operationErr, err)
@@ -128,13 +128,12 @@ func (s *Service) backupApplication(ctx context.Context, runID string, applicati
 	}
 	result.Dumps = len(point.Dumps)
 	if operationErr == nil && application.VerifyAfterBackup {
-		resticErr := s.restic.Check(ctx)
-		verification, verifyErr := s.verifyOne(ctx, runID, point, resticErr)
+		verification, verifyErr := s.verifyOne(ctx, runID, point, nil)
 		point.Verification = &verification
 		if verifyErr != nil {
 			operationErr = verifyErr
 			point.Status = "failed"
-			point.Error = safeerror.Clean(verifyErr).Error()
+			point.Error = s.cleanError(verifyErr)
 			_, _ = s.store.writeRecoveryPoint(point)
 			_ = s.catalog.ApplyRecoveryPoint(context.WithoutCancel(ctx), point, manifestPath)
 		}
@@ -185,7 +184,7 @@ func (s *Service) runHookPhase(ctx context.Context, phase string, commands []con
 		result.Status = "succeeded"
 		if err != nil {
 			result.Status = "failed"
-			result.Error = safeerror.Clean(err).Error()
+			result.Error = s.cleanError(err)
 		}
 		point.Hooks[len(point.Hooks)-1] = result
 		_, writeErr := s.store.writeRecoveryPoint(*point)

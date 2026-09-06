@@ -37,19 +37,22 @@ func Resolve(source Source) (value string, set bool, err error) {
 		return "", false, fmt.Errorf("secret: %s is set but has an empty path", fileName)
 	}
 
-	info, statErr := os.Stat(source.File)
-	if statErr != nil {
-		return "", false, fmt.Errorf("secret: inspect %s: %w", fileName, statErr)
-	}
-	if !info.Mode().IsRegular() {
-		return "", false, fmt.Errorf("secret: %s does not name a regular file", fileName)
-	}
-	if info.Size() > 1<<20 {
-		return "", false, fmt.Errorf("secret: %s exceeds 1 MiB", fileName)
-	}
 	file, openErr := os.Open(source.File)
 	if openErr != nil {
 		return "", false, fmt.Errorf("secret: open %s: %w", fileName, openErr)
+	}
+	info, statErr := file.Stat()
+	if statErr != nil {
+		file.Close()
+		return "", false, fmt.Errorf("secret: inspect %s: %w", fileName, statErr)
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return "", false, fmt.Errorf("secret: %s does not name a regular file", fileName)
+	}
+	if info.Size() > 1<<20 {
+		file.Close()
+		return "", false, fmt.Errorf("secret: %s exceeds 1 MiB", fileName)
 	}
 	contents, readErr := io.ReadAll(io.LimitReader(file, (1<<20)+1))
 	closeErr := file.Close()

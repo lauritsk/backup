@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Application Backup daily
+
+[Timer]
+OnCalendar=daily
+Persistent=yes
+RandomizedDelaySec=30m
+Unit=appbackup.service
+
+[Install]
+WantedBy=timers.target

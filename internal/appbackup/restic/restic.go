@@ -13,14 +13,17 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/lauritsk/backup/internal/processenv"
 )
 
 type Runner struct {
-	Binary     string
-	Repository string
-	Password   string
-	DataDir    string
-	Timeout    time.Duration
+	Binary       string
+	Repository   string
+	Password     string
+	PasswordFile string
+	DataDir      string
+	Timeout      time.Duration
 }
 
 func (r Runner) Version(ctx context.Context) (string, error) {
@@ -32,10 +35,25 @@ func (r Runner) Version(ctx context.Context) (string, error) {
 }
 
 func (r Runner) EnsureRepository(ctx context.Context) error {
-	if _, err := r.run(ctx, "cat", "config"); err == nil {
-		return nil
+	configPath := filepath.Join(r.Repository, "config")
+	info, err := os.Lstat(configPath)
+	switch {
+	case err == nil:
+		if !info.Mode().IsRegular() {
+			return errors.New("restic repository config is not a regular file")
+		}
+		_, err = r.run(ctx, "cat", "config")
+		return err
+	case !errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("inspect restic repository: %w", err)
+	default:
+		_, err = r.run(ctx, "init")
+		return err
 	}
-	_, err := r.run(ctx, "init")
+}
+
+func (r Runner) CheckRepository(ctx context.Context) error {
+	_, err := r.run(ctx, "cat", "config")
 	return err
 }
 
@@ -196,13 +214,15 @@ func (r Runner) validate(args []string) error {
 }
 
 func (r Runner) environment() []string {
-	result := make([]string, 0, len(os.Environ())+2)
-	for _, item := range os.Environ() {
-		if !strings.HasPrefix(item, "RESTIC_REPOSITORY=") && !strings.HasPrefix(item, "RESTIC_PASSWORD=") {
-			result = append(result, item)
-		}
+	result := processenv.Without(
+		"RESTIC_REPOSITORY", "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE",
+		"APPBACKUP_RESTIC_PASSWORD", "APPBACKUP_RESTIC_PASSWORD_FILE",
+	)
+	result = append(result, "RESTIC_REPOSITORY="+r.Repository)
+	if r.PasswordFile != "" {
+		return append(result, "RESTIC_PASSWORD_FILE="+r.PasswordFile)
 	}
-	return append(result, "RESTIC_REPOSITORY="+r.Repository, "RESTIC_PASSWORD="+r.Password)
+	return append(result, "RESTIC_PASSWORD="+r.Password)
 }
 
 func invalidValue(value string) bool { return value == "" || strings.ContainsAny(value, "\r\n\x00") }

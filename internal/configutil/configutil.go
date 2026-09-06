@@ -40,6 +40,19 @@ func DecodeFile(filename string, optional bool, maxBytes int64, target any) erro
 		return fmt.Errorf("load config %q: %w", filename, err)
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("load config %q: inspect file: %w", filename, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("load config %q: path is not a regular file", filename)
+	}
+	if info.Size() > maxBytes {
+		if maxBytes == 4<<20 {
+			return fmt.Errorf("load config %q: file exceeds 4 MiB", filename)
+		}
+		return fmt.Errorf("load config %q: file exceeds %d bytes", filename, maxBytes)
+	}
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
 		return fmt.Errorf("load config %q: %w", filename, err)
