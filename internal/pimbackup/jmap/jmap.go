@@ -4,7 +4,6 @@ package jmap
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	gojmap "git.sr.ht/~rockorager/go-jmap"
@@ -22,9 +22,10 @@ import (
 	"git.sr.ht/~rockorager/go-jmap/mail"
 	"git.sr.ht/~rockorager/go-jmap/mail/email"
 	"git.sr.ht/~rockorager/go-jmap/mail/mailbox"
-	"github.com/google/uuid"
+	"uuid"
 
 	"github.com/lauritsk/backup/internal/pimbackup/config"
+	"github.com/lauritsk/backup/internal/tlsconfig"
 )
 
 type Collection struct{ Name, RemoteID, Kind, URL string }
@@ -44,6 +45,9 @@ type Client struct {
 // New uses account.URL when set and otherwise discovers the standard JMAP
 // session resource at https://<host>/.well-known/jmap.
 func New(ctx context.Context, account config.AccountConfig) (*Client, error) {
+	if account.InsecureSkipVerify && !account.AllowInsecure {
+		return nil, errors.New("insecure_skip_verify requires allow_insecure = true")
+	}
 	endpoint, err := discoverEndpoint(account)
 	if err != nil {
 		return nil, err
@@ -52,9 +56,19 @@ func New(ctx context.Context, account config.AccountConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if parsed.Scheme != "https" && !account.AllowInsecure {
+		return nil, errors.New("an HTTP url requires allow_insecure = true")
+	}
+	tlsClientConfig, err := tlsconfig.Client("", account.CAFile, account.InsecureSkipVerify)
+	if err != nil {
+		return nil, fmt.Errorf("configure JMAP TLS: %w", err)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: account.InsecureSkipVerify}
-	authenticated := &authTransport{next: transport, account: account, sessionEndpoint: endpoint, sessionContext: ctx}
+	transport.TLSClientConfig = tlsClientConfig
+	authenticated, err := newAuthTransport(transport, account, endpoint, ctx)
+	if err != nil {
+		return nil, err
+	}
 	httpClient := &http.Client{Timeout: account.Timeout.Duration, Transport: authenticated}
 	httpClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		if len(via) > 10 {
@@ -63,12 +77,19 @@ func New(ctx context.Context, account config.AccountConfig) (*Client, error) {
 		if parsed.Scheme == "https" && request.URL.Scheme != "https" {
 			return errors.New("refusing JMAP HTTPS downgrade")
 		}
+		if !authenticated.allowedURL(request.URL) {
+			return errors.New("refusing JMAP redirect to an unapproved origin")
+		}
 		return nil
 	}
 	library := &gojmap.Client{SessionEndpoint: endpoint, HttpClient: httpClient}
 	if err := library.Authenticate(); err != nil {
 		httpClient.CloseIdleConnections()
 		return nil, fmt.Errorf("authenticate JMAP session: %w", err)
+	}
+	if err := authenticated.allowURLs(library.Session.APIURL, library.Session.DownloadURL, library.Session.UploadURL); err != nil {
+		httpClient.CloseIdleConnections()
+		return nil, err
 	}
 	if _, supported := library.Session.RawCapabilities[mail.URI]; !supported {
 		httpClient.CloseIdleConnections()
@@ -419,9 +440,60 @@ type authTransport struct {
 	account         config.AccountConfig
 	sessionEndpoint string
 	sessionContext  context.Context
+	mutex           sync.RWMutex
+	origins         map[string]struct{}
+}
+
+func newAuthTransport(next http.RoundTripper, account config.AccountConfig, endpoint string, sessionContext context.Context) (*authTransport, error) {
+	transport := &authTransport{next: next, account: account, sessionEndpoint: endpoint, sessionContext: sessionContext, origins: make(map[string]struct{})}
+	if err := transport.allowURLs(endpoint); err != nil {
+		return nil, fmt.Errorf("approve JMAP session origin: %w", err)
+	}
+	return transport, nil
+}
+
+func (t *authTransport) allowURLs(values ...string) error {
+	session, err := url.Parse(t.sessionEndpoint)
+	if err != nil {
+		return errors.New("invalid JMAP session URL")
+	}
+	origins := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return errors.New("JMAP session advertised an invalid service URL")
+		}
+		if session.Scheme == "https" && parsed.Scheme != "https" {
+			return errors.New("refusing JMAP HTTPS downgrade")
+		}
+		origins = append(origins, strings.ToLower(parsed.Scheme+"://"+parsed.Host))
+	}
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	for _, origin := range origins {
+		t.origins[origin] = struct{}{}
+	}
+	return nil
+}
+
+func (t *authTransport) allowedURL(value *url.URL) bool {
+	if value == nil || value.User != nil {
+		return false
+	}
+	origin := strings.ToLower(value.Scheme + "://" + value.Host)
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	_, allowed := t.origins[origin]
+	return allowed
 }
 
 func (t *authTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if !t.allowedURL(request.URL) {
+		return nil, errors.New("refusing to send JMAP credentials to an unapproved origin")
+	}
 	requestContext := request.Context()
 	if request.Method == http.MethodGet && request.URL.String() == t.sessionEndpoint {
 		requestContext = t.sessionContext

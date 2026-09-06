@@ -292,7 +292,7 @@ func TestJMAPBackupChangesVerifyAndRebuild(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := config.Config{DataDir: t.TempDir(), Accounts: []config.AccountConfig{{ID: "jmap", Protocol: "jmap", URL: server.URL + "/session", Auth: "bearer", ResolvedToken: "token", Collections: []string{"*"}, Timeout: config.Duration{Duration: 5 * time.Second}}}}
+	cfg := config.Config{DataDir: t.TempDir(), Accounts: []config.AccountConfig{{ID: "jmap", Protocol: "jmap", AllowInsecure: true, URL: server.URL + "/session", Auth: "bearer", ResolvedToken: "token", Collections: []string{"*"}, Timeout: config.Duration{Duration: 5 * time.Second}}}}
 	service, err := OpenService(context.Background(), cfg, ServiceOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		t.Fatal(err)
@@ -356,7 +356,7 @@ func TestCardDAVBackupVerifyRestoreAndRebuild(t *testing.T) {
 	}))
 	defer server.Close()
 	dataDir := t.TempDir()
-	cfg := config.Config{DataDir: dataDir, Accounts: []config.AccountConfig{{ID: "contacts", Protocol: "carddav", URL: server.URL + "/people/", Auth: "bearer", ResolvedToken: "token", Collections: []string{"*"}, Timeout: config.Duration{Duration: 5 * time.Second}}}}
+	cfg := config.Config{DataDir: dataDir, Accounts: []config.AccountConfig{{ID: "contacts", Protocol: "carddav", AllowInsecure: true, URL: server.URL + "/people/", Auth: "bearer", ResolvedToken: "token", Collections: []string{"*"}, Timeout: config.Duration{Duration: 5 * time.Second}}}}
 	service, err := OpenService(context.Background(), cfg, ServiceOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		t.Fatal(err)

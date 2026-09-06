@@ -9,9 +9,11 @@ type BackupRequest struct {
 
 type VerifyRequest struct {
 	RecoveryPointID string `json:"recovery_point_id,omitempty"`
+	ApplicationID   string `json:"application_id,omitempty"`
+	All             bool   `json:"all,omitempty"`
 }
 
-type RestoreRequest struct {
+type ExportRequest struct {
 	RecoveryPointID string `json:"recovery_point_id"`
 	Confirm         bool   `json:"confirm"`
 }
@@ -118,7 +120,7 @@ type VerificationRecord struct {
 	Issues          []VerificationIssue `json:"issues,omitempty"`
 }
 
-type RestoreReport struct {
+type ExportReport struct {
 	RecoveryPointID string `json:"recovery_point_id"`
 	Directory       string `json:"directory"`
 	SnapshotID      string `json:"snapshot_id"`

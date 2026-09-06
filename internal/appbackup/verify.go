@@ -4,20 +4,36 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/lauritsk/backup/internal/appbackup/config"
 	"github.com/lauritsk/backup/internal/appbackup/model"
-	"github.com/lauritsk/backup/internal/safeerror"
 )
 
 func (s *Service) verify(ctx context.Context, runID string, request model.VerifyRequest) (model.VerifyReport, error) {
-	points, err := s.catalog.AllRecoveryPoints(ctx, request.RecoveryPointID)
+	selectors := 0
+	for _, selected := range []bool{request.RecoveryPointID != "", request.ApplicationID != "", request.All} {
+		if selected {
+			selectors++
+		}
+	}
+	if selectors > 1 {
+		return model.VerifyReport{}, errors.New("verify accepts one recovery point, one application, or all")
+	}
+	if request.ApplicationID != "" {
+		application, found := s.config.Application(request.ApplicationID)
+		if !found || application.Disabled {
+			return model.VerifyReport{}, fmt.Errorf("application %q is not enabled", request.ApplicationID)
+		}
+	}
+	points, err := s.catalog.RecoveryPointsForVerification(ctx, request.RecoveryPointID, request.ApplicationID, request.All)
 	if err != nil {
 		return model.VerifyReport{}, err
+	}
+	if len(points) == 0 {
+		return model.VerifyReport{}, errors.New("no recovery points are available to verify")
 	}
 	report := model.VerifyReport{RecoveryPoints: len(points)}
 	var resticErr error
@@ -71,7 +87,7 @@ func (s *Service) verifyOne(ctx context.Context, runID string, point model.Recov
 		if err != nil || status != "passed" {
 			issue := model.VerificationIssue{RecoveryPointID: point.ID, Component: component, Status: status}
 			if err != nil {
-				issue.Error = safeerror.Clean(err).Error()
+				issue.Error = s.cleanError(err)
 			}
 			record.Issues = append(record.Issues, issue)
 		}
@@ -85,6 +101,10 @@ func (s *Service) verifyOne(ctx context.Context, runID string, point model.Recov
 		add("restic", "failed", resticErr)
 		return record, finish(resticErr)
 	}
+	if _, err := s.restic.List(ctx, point.SnapshotID, 1, 0); err != nil {
+		add("snapshot", "failed", err)
+		return record, finish(err)
+	}
 	add("restic", "passed", nil)
 	if len(point.Dumps) > 0 {
 		target, err := s.store.stagingDir(runID, "verify-"+point.ApplicationID)
@@ -92,7 +112,11 @@ func (s *Service) verifyOne(ctx context.Context, runID string, point model.Recov
 			add("restore", "failed", err)
 			return record, finish(err)
 		}
-		defer os.RemoveAll(filepath.Join(s.config.DataDir, "staging", runID))
+		defer func() {
+			if err := s.store.removeStaging(runID); err != nil {
+				s.logger.Warn("could not remove verification staging directory", "run_id", runID, "error", s.cleanError(err))
+			}
+		}()
 		if err := s.restic.Restore(ctx, point.SnapshotID, target); err != nil {
 			add("restore", "failed", err)
 			return record, finish(err)

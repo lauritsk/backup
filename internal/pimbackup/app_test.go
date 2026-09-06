@@ -52,7 +52,7 @@ func TestHelp(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run() code = %d, want 0", code)
 	}
-	if !strings.Contains(stdout.String(), "db rebuild") {
+	if !strings.Contains(stdout.String(), "repair") {
 		t.Fatalf("help output = %q", stdout.String())
 	}
 }

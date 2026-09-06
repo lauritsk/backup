@@ -41,11 +41,11 @@ func (c *testCatalog) GetRun(context.Context, string) (testRun, error) { return 
 func TestExecutorRecoversPanicAndFinishesRun(t *testing.T) {
 	catalog := &testCatalog{}
 	released := false
-	executor := New(context.Background(), catalog, func() (func() error, error) {
+	executor := New(catalog, func() (func() error, error) {
 		return func() error { released = true; return nil }, nil
 	}, func(context.Context) error { return nil }, func(record testRun) (string, runmodel.Operation) {
 		return record.ID, record.Operation
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	record, err := executor.Run(context.Background(), runmodel.OperationBackup, struct{}{}, func(context.Context, string) (any, error) {
 		panic("broken")
 	})
@@ -56,11 +56,11 @@ func TestExecutorRecoversPanicAndFinishesRun(t *testing.T) {
 
 func TestExecutorRecordsCancellation(t *testing.T) {
 	catalog := &testCatalog{}
-	executor := New(context.Background(), catalog, func() (func() error, error) {
+	executor := New(catalog, func() (func() error, error) {
 		return func() error { return nil }, nil
 	}, func(context.Context) error { return nil }, func(record testRun) (string, runmodel.Operation) {
 		return record.ID, record.Operation
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	record, err := executor.Run(ctx, runmodel.OperationVerify, struct{}{}, func(ctx context.Context, _ string) (any, error) {

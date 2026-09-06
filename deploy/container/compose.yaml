@@ -1,0 +1,77 @@
+services:
+  pimbackup:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Containerfile
+      target: pimbackup
+    command: ["backup", "--config", "/etc/backup/config.json"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:mode=0700,uid=65532,gid=65532
+    volumes:
+      - ./pimbackup.json:/etc/backup/config.json:ro
+      - ./data/pim:/data
+    secrets:
+      - pimbackup_password
+    restart: "no"
+
+  cloud-mirror:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Containerfile
+      target: rclone
+    command:
+      - sync
+      - archive:documents
+      - /mirror
+      - --config
+      - /run/secrets/rclone_config
+      - --check-first
+      - --transfers
+      - "4"
+    user: "65532:65532"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:mode=0700,uid=65532,gid=65532
+    volumes:
+      - ./data/cloud-mirror:/mirror
+    secrets:
+      - rclone_config
+    restart: "no"
+
+  appbackup:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Containerfile
+      target: appbackup
+    command: ["backup", "--config", "/etc/backup/config.json"]
+    depends_on:
+      cloud-mirror:
+        condition: service_completed_successfully
+    user: "65532:65532"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:mode=0700,uid=65532,gid=65532
+    volumes:
+      - ./appbackup.json:/etc/backup/config.json:ro
+      - ./data/app:/data
+      - ./data/cloud-mirror:/srv/cloud-mirror:ro
+      - ./source:/srv/example:ro
+    secrets:
+      - appbackup_restic_password
+    restart: "no"
+
+secrets:
+  pimbackup_password:
+    file: ./secrets/pimbackup-password
+  appbackup_restic_password:
+    file: ./secrets/restic-password
+  rclone_config:
+    file: ./secrets/rclone.conf

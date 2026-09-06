@@ -1,40 +1,49 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-/bin/
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Deny by default. Add new repository paths explicitly.
+*
 
-# Test binary, built with `go test -c`
-*.test
+# Repository metadata and automation
+!/.gitignore
+!/.containerignore
+!/.goreleaser.yaml
+!/.github/
+!/.github/**/
+!/.github/**/*.md
+!/.github/**/*.yml
+!/.github/**/*.yaml
 
-# Code coverage profiles and other test artifacts
-*.out
-coverage.*
-*.coverprofile
-profile.cov
+# Go source
+!/go.mod
+!/go.sum
+!/cmd/
+!/cmd/**/
+!/cmd/**/*.go
+!/internal/
+!/internal/**/
+!/internal/**/*.go
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Documentation, licensing, and project tools
+!/LICENSE
+!/README.md
+!/SPEC.md
+!/cog.toml
+!/hk.pkl
+!/mise.toml
+!/mise.lock
 
-# Go workspace file
-go.work
-go.work.sum
+# Sanitized examples
+!/configs/
+!/configs/appbackup.example.json
+!/configs/cloud-mirror.appbackup.example.json
+!/configs/pimbackup.example.json
 
-# env file
-.env
-
-# Local hk configuration
-hk.local.pkl
-.config/hk.local.pkl
-
-# Editor/IDE
-# .idea/
-# .vscode/
-
-# Release artifacts
-dist/
+# Deployment definitions
+!/deploy/
+!/deploy/**/
+!/deploy/**/*.md
+!/deploy/**/*.service
+!/deploy/**/*.timer
+!/deploy/**/*.conf
+!/deploy/**/*.json
+!/deploy/**/*.yaml
+!/deploy/**/Containerfile
+!/deploy/**/Containerfile.dockerignore

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"sync"
 	"time"
 
 	runmodel "github.com/lauritsk/backup/internal/run"
@@ -26,20 +25,22 @@ type Catalog[R any] interface {
 type Action func(context.Context, string) (any, error)
 
 type Executor[R any] struct {
-	ctx        context.Context
 	catalog    Catalog[R]
 	acquire    func() (func() error, error)
 	initialize func(context.Context) error
 	identity   func(R) (string, runmodel.Operation)
 	logger     *slog.Logger
-	async      sync.WaitGroup
+	clean      func(error) error
 }
 
-func New[R any](ctx context.Context, catalog Catalog[R], acquire func() (func() error, error), initialize func(context.Context) error, identity func(R) (string, runmodel.Operation), logger *slog.Logger) *Executor[R] {
+func New[R any](catalog Catalog[R], acquire func() (func() error, error), initialize func(context.Context) error, identity func(R) (string, runmodel.Operation), logger *slog.Logger, clean func(error) error) *Executor[R] {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Executor[R]{ctx: ctx, catalog: catalog, acquire: acquire, initialize: initialize, identity: identity, logger: logger}
+	if clean == nil {
+		clean = safeerror.Clean
+	}
+	return &Executor[R]{catalog: catalog, acquire: acquire, initialize: initialize, identity: identity, logger: logger, clean: clean}
 }
 
 func (e *Executor[R]) Run(ctx context.Context, operation runmodel.Operation, request any, action Action) (R, error) {
@@ -50,29 +51,6 @@ func (e *Executor[R]) Run(ctx context.Context, operation runmodel.Operation, req
 	}
 	return prepared.execute(ctx)
 }
-
-func (e *Executor[R]) Queue(ctx context.Context, operation runmodel.Operation, request any, action Action) (R, error) {
-	prepared, err := e.prepare(ctx, operation, request, action)
-	if err != nil {
-		var zero R
-		return zero, err
-	}
-	e.async.Add(1)
-	go func() {
-		defer e.async.Done()
-		record, runErr := prepared.execute(e.ctx)
-		id, op := e.identity(record)
-		if runErr != nil {
-			e.logger.Error("asynchronous operation failed", "run_id", id, "operation", op, "error", runErr)
-			return
-		}
-		_, statusOp := e.identity(record)
-		e.logger.Info("asynchronous operation finished", "run_id", id, "operation", statusOp)
-	}()
-	return prepared.record, nil
-}
-
-func (e *Executor[R]) Wait() { e.async.Wait() }
 
 type prepared[R any] struct {
 	executor  *Executor[R]
@@ -126,7 +104,7 @@ func (p *prepared[R]) execute(ctx context.Context) (result R, resultErr error) {
 
 	finishCtx, cancelFinish := context.WithTimeout(context.Background(), catalogTimeout)
 	defer cancelFinish()
-	if err := p.executor.catalog.FinishRun(finishCtx, p.id, status, safeerror.Clean(operationErr), detail); err != nil {
+	if err := p.executor.catalog.FinishRun(finishCtx, p.id, status, p.executor.clean(operationErr), detail); err != nil {
 		return result, errors.Join(operationErr, err)
 	}
 	finished, err := p.executor.catalog.GetRun(finishCtx, p.id)

@@ -1,0 +1,10 @@
+{
+  "accounts": [
+    {
+      "id": "personal",
+      "protocol": "imap",
+      "host": "imap.example.com",
+      "username": "person@example.com"
+    }
+  ]
+}

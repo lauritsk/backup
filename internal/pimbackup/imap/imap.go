@@ -16,6 +16,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 
 	"github.com/lauritsk/backup/internal/pimbackup/config"
+	"github.com/lauritsk/backup/internal/tlsconfig"
 )
 
 type Mailbox struct {
@@ -46,7 +47,7 @@ type Remote interface {
 	ListMailboxes(context.Context) ([]Mailbox, error)
 	SelectMailbox(context.Context, string) (SelectedMailbox, error)
 	SearchUIDsAfter(context.Context, uint32) ([]uint32, error)
-	FetchMessage(context.Context, uint32, func(FetchedMessage, io.Reader) error) error
+	FetchMessages(context.Context, []uint32, func(FetchedMessage, io.Reader) error) error
 	EnsureMailbox(context.Context, string) error
 	Append(context.Context, string, int64, []string, *time.Time, io.Reader) (AppendResult, error)
 	Close() error
@@ -59,6 +60,12 @@ type Dialer interface {
 type NetworkDialer struct{}
 
 func (NetworkDialer) Dial(ctx context.Context, account config.AccountConfig) (Remote, error) {
+	if account.InsecureSkipVerify && !account.AllowInsecure {
+		return nil, errors.New("insecure_skip_verify requires allow_insecure = true")
+	}
+	if account.TLS == "plain" && !account.AllowInsecure {
+		return nil, errors.New("tls = plain requires allow_insecure = true")
+	}
 	address := net.JoinHostPort(account.Host, fmt.Sprintf("%d", account.Port))
 	dialer := &net.Dialer{Timeout: account.Timeout.Duration}
 	rawConnection, err := dialer.DialContext(ctx, "tcp", address)
@@ -71,12 +78,12 @@ func (NetworkDialer) Dial(ctx context.Context, account config.AccountConfig) (Re
 		return nil, fmt.Errorf("set IMAP authentication deadline for account %q: %w", account.ID, err)
 	}
 
-	tlsConfig := &tls.Config{
-		ServerName:         account.Host,
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: account.InsecureSkipVerify,
-		NextProtos:         []string{"imap"},
+	tlsConfig, err := tlsconfig.Client(account.Host, account.CAFile, account.InsecureSkipVerify)
+	if err != nil {
+		rawConnection.Close()
+		return nil, fmt.Errorf("configure IMAP TLS for account %q: %w", account.ID, err)
 	}
+	tlsConfig.NextProtos = []string{"imap"}
 	options := &imapclient.Options{TLSConfig: tlsConfig}
 	var client *imapclient.Client
 	switch account.TLS {
@@ -305,14 +312,24 @@ func (r *clientRemote) SearchUIDsAfter(ctx context.Context, after uint32) ([]uin
 	return out, nil
 }
 
-func (r *clientRemote) FetchMessage(ctx context.Context, uid uint32, consume func(FetchedMessage, io.Reader) error) error {
+func (r *clientRemote) FetchMessages(ctx context.Context, uids []uint32, consume func(FetchedMessage, io.Reader) error) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	setValues := make([]goimap.UID, len(uids))
+	for index, uid := range uids {
+		if uid == 0 || index > 0 && uid <= uids[index-1] {
+			return errors.New("IMAP fetch UIDs must be positive, unique, and sorted")
+		}
+		setValues[index] = goimap.UID(uid)
+	}
 	clearDeadline, err := r.operationDeadline(ctx)
 	if err != nil {
 		return err
 	}
 	defer clearDeadline()
 	bodySection := &goimap.FetchItemBodySection{Peek: true}
-	command := r.client.Fetch(goimap.UIDSetNum(goimap.UID(uid)), &goimap.FetchOptions{
+	command := r.client.Fetch(goimap.UIDSetNum(setValues...), &goimap.FetchOptions{
 		UID:          true,
 		Flags:        true,
 		InternalDate: true,
@@ -327,65 +344,67 @@ func (r *clientRemote) FetchMessage(ctx context.Context, uid uint32, consume fun
 		}
 	}()
 
-	data := command.Next()
-	if data == nil {
-		err := command.Close()
-		closed = true
-		if err != nil {
-			return fmt.Errorf("fetch IMAP UID %d: %w", uid, err)
-		}
-		return fmt.Errorf("fetch IMAP UID %d: server returned no message", uid)
+	expected := make(map[uint32]struct{}, len(uids))
+	for _, uid := range uids {
+		expected[uid] = struct{}{}
 	}
-	fetched := FetchedMessage{Size: -1}
-	bodySeen := false
-	for {
-		item := data.Next()
-		if item == nil {
-			break
+	seen := make(map[uint32]struct{}, len(uids))
+	for data := command.Next(); data != nil; data = command.Next() {
+		fetched := FetchedMessage{Size: -1}
+		bodySeen := false
+		for {
+			item := data.Next()
+			if item == nil {
+				break
+			}
+			switch item := item.(type) {
+			case imapclient.FetchItemDataUID:
+				fetched.UID = uint32(item.UID)
+			case imapclient.FetchItemDataFlags:
+				fetched.Flags = make([]string, len(item.Flags))
+				for index, flag := range item.Flags {
+					fetched.Flags[index] = string(flag)
+				}
+			case imapclient.FetchItemDataInternalDate:
+				value := item.Time.UTC()
+				fetched.InternalDate = &value
+			case imapclient.FetchItemDataRFC822Size:
+				fetched.Size = item.Size
+			case imapclient.FetchItemDataBodySection:
+				if bodySeen {
+					return fmt.Errorf("fetch IMAP UID %d: server returned multiple bodies", fetched.UID)
+				}
+				if item.Literal == nil {
+					return fmt.Errorf("fetch IMAP UID %d: server returned an empty body item", fetched.UID)
+				}
+				if _, requested := expected[fetched.UID]; !requested {
+					return fmt.Errorf("fetch IMAP batch: server returned unrequested UID %d", fetched.UID)
+				}
+				if _, duplicate := seen[fetched.UID]; duplicate {
+					return fmt.Errorf("fetch IMAP batch: server returned UID %d more than once", fetched.UID)
+				}
+				if fetched.Size < 0 {
+					return fmt.Errorf("fetch IMAP UID %d: server did not return RFC822.SIZE", fetched.UID)
+				}
+				bodySeen = true
+				if err := consume(fetched, item.Literal); err != nil {
+					return err
+				}
+			}
 		}
-		switch item := item.(type) {
-		case imapclient.FetchItemDataUID:
-			fetched.UID = uint32(item.UID)
-		case imapclient.FetchItemDataFlags:
-			fetched.Flags = make([]string, len(item.Flags))
-			for i, flag := range item.Flags {
-				fetched.Flags[i] = string(flag)
-			}
-		case imapclient.FetchItemDataInternalDate:
-			value := item.Time.UTC()
-			fetched.InternalDate = &value
-		case imapclient.FetchItemDataRFC822Size:
-			fetched.Size = item.Size
-		case imapclient.FetchItemDataBodySection:
-			if bodySeen {
-				return fmt.Errorf("fetch IMAP UID %d: server returned multiple bodies", uid)
-			}
-			if item.Literal == nil {
-				return fmt.Errorf("fetch IMAP UID %d: server returned an empty body item", uid)
-			}
-			if fetched.UID != uid {
-				return fmt.Errorf("fetch IMAP UID %d: server returned UID %d", uid, fetched.UID)
-			}
-			if fetched.Size < 0 {
-				return fmt.Errorf("fetch IMAP UID %d: server did not return RFC822.SIZE", uid)
-			}
-			bodySeen = true
-			if err := consume(fetched, item.Literal); err != nil {
-				return err
-			}
+		if !bodySeen {
+			return errors.New("fetch IMAP batch: response had no message body")
 		}
-	}
-	if !bodySeen {
-		return fmt.Errorf("fetch IMAP UID %d: server did not return the message body", uid)
-	}
-	if extra := command.Next(); extra != nil {
-		return fmt.Errorf("fetch IMAP UID %d: server returned more than one message", uid)
+		seen[fetched.UID] = struct{}{}
 	}
 	if err := command.Close(); err != nil {
 		closed = true
-		return fmt.Errorf("fetch IMAP UID %d: %w", uid, err)
+		return fmt.Errorf("fetch IMAP batch: %w", err)
 	}
 	closed = true
+	if len(seen) != len(uids) {
+		return fmt.Errorf("fetch IMAP batch: server returned %d of %d messages", len(seen), len(uids))
+	}
 	return nil
 }
 

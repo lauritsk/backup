@@ -1,52 +1,23 @@
 {
-  "data_dir": "/data",
   "restic": {
-    "binary": "restic",
-    "repository": "/data/restic",
-    "password_file": "/run/secrets/appbackup_restic_password",
-    "timeout": "4h"
-  },
-  "server": {
-    "listen": "127.0.0.1:8080",
-    "read_header_timeout": "5s",
-    "read_timeout": "30s",
-    "idle_timeout": "60s",
-    "shutdown_timeout": "15s"
-  },
-  "schedule": {
-    "enabled": true,
-    "interval": "24h",
-    "run_on_start": false
-  },
-  "log": {
-    "level": "info",
-    "format": "json"
+    "password_file": "/run/secrets/appbackup_restic_password"
   },
   "applications": [
     {
       "id": "website",
-      "paths": ["/srv/website/uploads", "/etc/website"],
+      "paths": [
+        "/srv/website/uploads"
+      ],
       "databases": [
         {
           "id": "postgres",
           "type": "postgresql",
           "host": "postgres",
-          "port": 5432,
           "user": "backup",
           "name": "website",
-          "password_file": "/run/secrets/website_postgres_password",
-          "timeout": "1h"
+          "password_file": "/run/secrets/website_postgres_password"
         }
       ],
-      "hooks": {
-        "quiesce": [
-          {"binary": "/usr/local/bin/website-maintenance", "args": ["on"], "timeout": "2m"}
-        ],
-        "unquiesce": [
-          {"binary": "/usr/local/bin/website-maintenance", "args": ["off"], "timeout": "2m"}
-        ]
-      },
-      "timeout": "4h",
       "verify_after_backup": true
     }
   ]

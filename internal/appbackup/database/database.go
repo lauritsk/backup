@@ -17,6 +17,7 @@ import (
 
 	"github.com/lauritsk/backup/internal/appbackup/config"
 	"github.com/lauritsk/backup/internal/atomicfile"
+	"github.com/lauritsk/backup/internal/processenv"
 	_ "modernc.org/sqlite"
 )
 
@@ -270,12 +271,10 @@ func run(ctx context.Context, database config.DatabaseConfig, binary string, arg
 }
 
 func databaseEnvironment(database config.DatabaseConfig) []string {
-	result := make([]string, 0, len(os.Environ())+1)
-	for _, item := range os.Environ() {
-		if !strings.HasPrefix(item, "PGPASSWORD=") && !strings.HasPrefix(item, "MYSQL_PWD=") {
-			result = append(result, item)
-		}
-	}
+	result := processenv.Without(
+		"PGPASSWORD", "MYSQL_PWD", "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE",
+		"APPBACKUP_RESTIC_PASSWORD", "APPBACKUP_RESTIC_PASSWORD_FILE",
+	)
 	if database.ResolvedPassword != "" {
 		if database.Type == "postgresql" {
 			result = append(result, "PGPASSWORD="+database.ResolvedPassword)

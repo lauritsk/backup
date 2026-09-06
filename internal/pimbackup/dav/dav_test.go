@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,7 +61,7 @@ func TestCardDAVDiscoveryAndRoundTrip(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), config.AccountConfig{Protocol: "carddav", URL: server.URL + "/dav/", Auth: "basic", Username: "user", ResolvedPassword: "secret", Timeout: config.Duration{Duration: time.Second}})
+	client, err := New(context.Background(), config.AccountConfig{Protocol: "carddav", AllowInsecure: true, URL: server.URL + "/dav/", Auth: "basic", Username: "user", ResolvedPassword: "secret", Timeout: config.Duration{Duration: time.Second}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,6 +97,32 @@ func TestCardDAVDiscoveryAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGetRefusesCredentialsForAnotherOrigin(t *testing.T) {
+	var reached atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) }))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, target.URL+"/contact.vcf", http.StatusFound)
+	}))
+	defer source.Close()
+	client, err := New(context.Background(), config.AccountConfig{Protocol: "carddav", AllowInsecure: true, URL: source.URL + "/dav/", Auth: "basic", Username: "user", ResolvedPassword: "secret", Timeout: config.Duration{Duration: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, _, err = client.Objects(context.Background(), Collection{RemoteID: "/", URL: target.URL + "/", SyncToken: "token"})
+	if err == nil || !strings.Contains(err.Error(), "another origin") {
+		t.Fatalf("Objects() = %v", err)
+	}
+	_, _, err = client.Get(context.Background(), Object{RemoteID: "/contact.vcf"})
+	if err == nil || !strings.Contains(err.Error(), "another origin") {
+		t.Fatalf("Get() = %v", err)
+	}
+	if reached.Load() {
+		t.Fatal("unapproved origin received request")
+	}
+}
+
 func TestSyncCollectionUsesAndAdvancesToken(t *testing.T) {
 	var requestBody string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -110,7 +137,7 @@ func TestSyncCollectionUsesAndAdvancesToken(t *testing.T) {
 		_, _ = io.WriteString(writer, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/changed.vcf</d:href><d:propstat><d:prop><d:getetag>"two"</d:getetag><d:getcontenttype>text/vcard</d:getcontenttype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/dav/deleted.vcf</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response><d:sync-token>token-2</d:sync-token></d:multistatus>`)
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), config.AccountConfig{Protocol: "carddav", URL: server.URL + "/dav/", Timeout: config.Duration{Duration: time.Second}})
+	client, err := New(context.Background(), config.AccountConfig{Protocol: "carddav", AllowInsecure: true, URL: server.URL + "/dav/", Timeout: config.Duration{Duration: time.Second}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +179,7 @@ func TestCalDAVDiscoveryAndRestore(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), config.AccountConfig{Protocol: "caldav", URL: server.URL + "/cal/", Auth: "bearer", ResolvedToken: "token", Timeout: config.Duration{Duration: time.Second}})
+	client, err := New(context.Background(), config.AccountConfig{Protocol: "caldav", AllowInsecure: true, URL: server.URL + "/cal/", Auth: "bearer", ResolvedToken: "token", Timeout: config.Duration{Duration: time.Second}})
 	if err != nil {
 		t.Fatal(err)
 	}

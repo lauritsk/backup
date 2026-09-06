@@ -1,0 +1,15 @@
+# Podman and Buildah context allowlist. Docker uses the adjacent
+# deploy/container/Containerfile.dockerignore file instead.
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**/
+!cmd/**/*.go
+!internal/
+!internal/**/
+!internal/**/*.go
+!deploy/
+!deploy/container/
+!deploy/container/Containerfile
+!deploy/container/Containerfile.dockerignore

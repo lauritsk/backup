@@ -18,8 +18,8 @@ func TestInfoFormat(t *testing.T) {
 }
 
 func TestInfoFormatUsesFallbacks(t *testing.T) {
-	got := (Info{}).Format("cloudbackup")
-	want := "cloudbackup version=dev revision=unknown build_time=unknown go=unknown"
+	got := (Info{}).Format("appbackup")
+	want := "appbackup version=dev revision=unknown build_time=unknown go=unknown"
 	if got != want {
 		t.Fatalf("Format() = %q, want %q", got, want)
 	}

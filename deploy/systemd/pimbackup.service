@@ -1,0 +1,37 @@
+[Unit]
+Description=Back up mail, contacts, and calendars
+Documentation=https://github.com/lauritsk/backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=backup
+Group=backup
+UMask=0077
+StateDirectory=pimbackup
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/pimbackup backup --config /etc/backup/pimbackup.json --data-dir /var/lib/pimbackup
+LoadCredential=pim-password:/etc/backup/credentials/pim-password
+Environment=PIMBACKUP_ACCOUNT_PERSONAL_PASSWORD_FILE=/run/credentials/pimbackup.service/pim-password
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pimbackup
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

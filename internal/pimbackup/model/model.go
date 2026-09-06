@@ -1,5 +1,5 @@
 // Package model contains PIM Backup domain records shared by its catalog,
-// storage, protocol, CLI, and HTTP code.
+// storage, protocol, and CLI code.
 package model
 
 import "time"

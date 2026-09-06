@@ -26,19 +26,19 @@ func TestLoadPrecedenceAndSecretFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	configPath := filepath.Join(dir, "pimbackup.json")
-	contents := `{"server":{"listen":"127.0.0.1:7000"},"log":{"level":"warn","format":"text"},"accounts":[{"id":"personal","host":"imap.example.test","username":"user","password_file":` + quoteJSON(passwordPath) + `,"mailboxes":["INBOX"]}]}`
+	contents := `{"data_dir":"/from-json","log":{"level":"warn","format":"text"},"accounts":[{"id":"personal","host":"imap.example.test","username":"user","password_file":` + quoteJSON(passwordPath) + `,"mailboxes":["INBOX"]}]}`
 	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PIMBACKUP_CONFIG", configPath)
-	t.Setenv("PIMBACKUP_LISTEN", "127.0.0.1:7001")
+	t.Setenv("PIMBACKUP_DATA_DIR", "/from-environment")
 	t.Setenv("PIMBACKUP_LOG_LEVEL", "error")
-	cliListen := "127.0.0.1:7002"
-	cfg, err := Load(Overrides{Listen: &cliListen})
+	cliDataDir := t.TempDir()
+	cfg, err := Load(Overrides{DataDir: &cliDataDir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DataDir != "/data" || cfg.Server.Listen != cliListen || cfg.Log.Level != "error" || cfg.Log.Format != "text" {
+	if cfg.DataDir != cliDataDir || cfg.Log.Level != "error" || cfg.Log.Format != "text" {
 		t.Fatalf("effective config = %#v", cfg)
 	}
 	if len(cfg.Accounts) != 1 || cfg.Accounts[0].ResolvedPassword != "from-file" {
@@ -50,6 +50,12 @@ func TestLoadPrecedenceAndSecretFile(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() = %v", err)
+	}
+}
+
+func TestDefaultsUseTextLogs(t *testing.T) {
+	if got := defaults().Log.Format; got != "text" {
+		t.Fatalf("default log format = %q", got)
 	}
 }
 
@@ -116,24 +122,16 @@ func TestLoadRejectsUnknownJSONField(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsAnotherDataDirectory(t *testing.T) {
+func TestValidateDataDirectory(t *testing.T) {
 	cfg := defaults()
 	cfg.DataDir = t.TempDir()
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "fixed at /data") {
-		t.Fatalf("Validate() error = %v", err)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
 	}
-}
-
-func TestValidateRequiresAuthenticationForRemoteListener(t *testing.T) {
-	for _, listen := range []string{"0.0.0.0:8080", ":8080", "[::]:8080"} {
-		cfg := defaults()
-		cfg.Server.Listen = listen
-		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "non-loopback") {
-			t.Fatalf("Validate() for %q = %v", listen, err)
-		}
-		cfg.Server.ResolvedAuthToken = "token"
-		if err := cfg.Validate(); err != nil {
-			t.Fatalf("Validate() for %q with token = %v", listen, err)
+	for _, invalid := range []string{"relative", "/"} {
+		cfg.DataDir = invalid
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "clean absolute") {
+			t.Fatalf("Validate(%q) error = %v", invalid, err)
 		}
 	}
 }
@@ -168,11 +166,20 @@ func TestValidateRejectsInsecureHTTPPIMAccount(t *testing.T) {
 	}
 }
 
+func TestValidateRequiresExplicitInsecureTLSAcknowledgement(t *testing.T) {
+	account := AccountConfig{ID: "mail", Protocol: "imap", Host: "mail.example", Port: 993, TLS: "implicit", Username: "user", ResolvedPassword: "password", InsecureSkipVerify: true, Timeout: Duration{Duration: time.Second}, Mailboxes: []string{"*"}}
+	if err := validateAccount(account); err == nil || !strings.Contains(err.Error(), "insecure_skip_verify requires") {
+		t.Fatalf("validateAccount() = %v", err)
+	}
+	account.AllowInsecure = true
+	if err := validateAccount(account); err != nil {
+		t.Fatalf("validateAccount() with acknowledgement = %v", err)
+	}
+}
+
 func TestRedactedCopyEncodesNoSecret(t *testing.T) {
 	secretValue := "very-secret"
 	cfg := defaults()
-	cfg.Server.AuthToken = &secretValue
-	cfg.Server.ResolvedAuthToken = secretValue
 	cfg.Accounts = []AccountConfig{{ID: "personal", Protocol: "imap", Host: "imap.example.test", Port: 993, TLS: "implicit", Username: "user", Password: &secretValue, ResolvedPassword: secretValue, Mailboxes: []string{"*"}, Timeout: Duration{Duration: time.Second}}}
 	var output bytes.Buffer
 	encoder := json.NewEncoder(&output)

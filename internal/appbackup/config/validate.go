@@ -3,24 +3,18 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
-	"unicode"
 )
 
 var idPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 
 func (cfg Config) Validate() error {
 	var problems []string
-	if cfg.DataDir != "/data" {
-		problems = append(problems, "data_dir is fixed at /data")
-	}
-	if cfg.Restic.Repository != filepath.Join(cfg.DataDir, "restic") {
-		problems = append(problems, "restic.repository is fixed at /data/restic")
+	if !filepath.IsAbs(cfg.DataDir) || filepath.Clean(cfg.DataDir) != cfg.DataDir || cfg.DataDir == string(filepath.Separator) || strings.ContainsAny(cfg.DataDir, "\r\n\x00") {
+		problems = append(problems, "data_dir must be a clean absolute path other than the filesystem root")
 	}
 	if invalidText(cfg.Restic.Binary) {
 		problems = append(problems, "restic.binary cannot be empty or contain control characters")
@@ -31,28 +25,16 @@ func (cfg Config) Validate() error {
 	if cfg.Restic.Timeout.Duration <= 0 {
 		problems = append(problems, "restic.timeout must be greater than zero")
 	}
-	if err := validateServer(cfg.Server); err != nil {
-		problems = append(problems, err.Error())
-	}
-	if cfg.Schedule.Interval.Duration < 0 || cfg.Schedule.Enabled && cfg.Schedule.Interval.Duration < time.Minute {
-		problems = append(problems, "schedule.interval must be at least 1m when scheduling is enabled")
-	}
 	if !oneOf(cfg.Log.Level, "debug", "info", "warn", "error") {
 		problems = append(problems, "log.level must be debug, info, warn, or error")
 	}
 	if !oneOf(cfg.Log.Format, "json", "text") {
 		problems = append(problems, "log.format must be json or text")
 	}
-	if cfg.Engine != nil {
-		if !oneOf(cfg.Engine.Type, "docker", "podman") || !filepath.IsAbs(cfg.Engine.Socket) || filepath.Clean(cfg.Engine.Socket) != cfg.Engine.Socket || strings.ContainsAny(cfg.Engine.Socket, "\r\n\x00") {
-			problems = append(problems, "engine requires type docker or podman and a clean absolute socket path")
-		}
-	}
 	if len(cfg.Applications) > 1000 {
 		problems = append(problems, "applications accepts at most 1000 entries")
 	}
 	seen := map[string]bool{}
-	enabled := 0
 	for index, app := range cfg.Applications {
 		prefix := fmt.Sprintf("applications[%d]", index)
 		if app.ID != "" {
@@ -61,41 +43,10 @@ func (cfg Config) Validate() error {
 		if err := validateApplication(cfg.DataDir, app); err != nil {
 			problems = append(problems, prefix+": "+err.Error())
 		}
-		for _, database := range app.Databases {
-			if database.VerifyCommand == nil {
-				continue
-			}
-			if engineType := containerEngineType(database.VerifyCommand.Binary); engineType != "" && (cfg.Engine == nil || cfg.Engine.Type != engineType) {
-				problems = append(problems, prefix+": database "+strconv.Quote(database.ID)+" container verification requires a matching engine configuration")
-			}
-		}
 		if seen[app.ID] {
 			problems = append(problems, prefix+": duplicate application ID")
 		}
 		seen[app.ID] = true
-		if !app.Disabled {
-			enabled++
-		}
-	}
-	if cfg.Schedule.Enabled && enabled == 0 {
-		problems = append(problems, "schedule.enabled requires at least one enabled application")
-	}
-	return joinProblems(problems)
-}
-
-func validateServer(server ServerConfig) error {
-	var problems []string
-	host, _, err := net.SplitHostPort(server.Listen)
-	if server.Listen == "" || err != nil {
-		problems = append(problems, "server.listen must be a host:port address")
-	} else if !loopback(host) && server.ResolvedAuthToken == "" && !server.AllowUnauthenticated {
-		problems = append(problems, "a non-loopback server.listen requires server.auth_token or server.allow_unauthenticated = true")
-	}
-	if strings.IndexFunc(server.ResolvedAuthToken, unicode.IsSpace) >= 0 {
-		problems = append(problems, "server.auth_token cannot contain whitespace")
-	}
-	if server.ReadHeaderTimeout.Duration <= 0 || server.ReadTimeout.Duration <= 0 || server.IdleTimeout.Duration <= 0 || server.ShutdownTimeout.Duration <= 0 {
-		problems = append(problems, "server timeouts must be greater than zero")
 	}
 	return joinProblems(problems)
 }
@@ -127,12 +78,12 @@ func validateApplication(dataDir string, app ApplicationConfig) error {
 			problems = append(problems, "paths must be clean absolute paths")
 		}
 		if within(dataDir, path) || within(path, dataDir) {
-			problems = append(problems, "paths cannot overlap appbackup data beneath /data")
+			problems = append(problems, "paths cannot overlap appbackup data_dir")
 		}
 	}
 	databaseIDs := map[string]bool{}
 	for _, database := range app.Databases {
-		if err := validateDatabase(database); err != nil {
+		if err := validateDatabase(dataDir, database); err != nil {
 			problems = append(problems, "database "+strconv.Quote(database.ID)+": "+err.Error())
 		}
 		if databaseIDs[database.ID] {
@@ -153,7 +104,7 @@ func validateApplication(dataDir string, app ApplicationConfig) error {
 	return joinProblems(problems)
 }
 
-func validateDatabase(database DatabaseConfig) error {
+func validateDatabase(dataDir string, database DatabaseConfig) error {
 	var problems []string
 	if !idPattern.MatchString(database.ID) {
 		problems = append(problems, "id must match "+idPattern.String())
@@ -184,8 +135,8 @@ func validateDatabase(database DatabaseConfig) error {
 	if database.Type == "sqlite" {
 		if !filepath.IsAbs(database.Path) || filepath.Clean(database.Path) != database.Path || invalidText(database.Path) {
 			problems = append(problems, "path must be a clean absolute path")
-		} else if within("/data", database.Path) || within(database.Path, "/data") {
-			problems = append(problems, "path cannot overlap appbackup data beneath /data")
+		} else if within(dataDir, database.Path) || within(database.Path, dataDir) {
+			problems = append(problems, "path cannot overlap appbackup data_dir")
 		}
 		if database.Host != "" || database.Port != 0 || database.User != "" || database.Name != "" || database.Password != nil {
 			problems = append(problems, "sqlite does not accept network connection fields")
@@ -242,13 +193,6 @@ func oneOf(value string, choices ...string) bool {
 func within(root, name string) bool {
 	rel, err := filepath.Rel(root, name)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-func loopback(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	return ip != nil && ip.IsLoopback()
 }
 func joinProblems(problems []string) error {
 	if len(problems) == 0 {

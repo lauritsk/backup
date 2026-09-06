@@ -4,15 +4,14 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/lauritsk/backup/internal/configutil"
 	"github.com/lauritsk/backup/internal/secret"
@@ -29,31 +28,11 @@ type Duration = configutil.Duration
 
 // Config is the effective PIM Backup configuration.
 type Config struct {
-	DataDir  string          `json:"data_dir"`
-	Server   ServerConfig    `json:"server"`
-	Schedule ScheduleConfig  `json:"schedule"`
-	Log      LogConfig       `json:"log"`
+	DataDir  string          `json:"data_dir,omitempty"`
+	Log      LogConfig       `json:"log,omitempty"`
 	Accounts []AccountConfig `json:"accounts"`
 
 	SourcePath string `json:"-"`
-}
-
-type ServerConfig struct {
-	Listen               string   `json:"listen"`
-	ReadHeaderTimeout    Duration `json:"read_header_timeout"`
-	ReadTimeout          Duration `json:"read_timeout"`
-	IdleTimeout          Duration `json:"idle_timeout"`
-	ShutdownTimeout      Duration `json:"shutdown_timeout"`
-	AuthToken            *string  `json:"auth_token,omitempty"`
-	AuthTokenFile        *string  `json:"auth_token_file,omitempty"`
-	AllowUnauthenticated bool     `json:"allow_unauthenticated"`
-	ResolvedAuthToken    string   `json:"-"`
-}
-
-type ScheduleConfig struct {
-	Enabled    bool     `json:"enabled"`
-	Interval   Duration `json:"interval"`
-	RunOnStart bool     `json:"run_on_start"`
 }
 
 type LogConfig struct {
@@ -71,6 +50,7 @@ type AccountConfig struct {
 	TLS                string   `json:"tls"`
 	InsecureSkipVerify bool     `json:"insecure_skip_verify"`
 	AllowInsecure      bool     `json:"allow_insecure"`
+	CAFile             string   `json:"ca_file,omitempty"`
 	Username           string   `json:"username"`
 	Password           *string  `json:"password,omitempty"`
 	PasswordFile       *string  `json:"password_file,omitempty"`
@@ -90,7 +70,7 @@ type AccountConfig struct {
 // Overrides are CLI values. Pointer fields preserve whether a flag was set.
 type Overrides struct {
 	ConfigPath *string
-	Listen     *string
+	DataDir    *string
 	LogLevel   *string
 	LogFormat  *string
 }
@@ -119,19 +99,9 @@ func Load(overrides Overrides) (Config, error) {
 func defaults() Config {
 	return Config{
 		DataDir: "/data",
-		Server: ServerConfig{
-			Listen:            "127.0.0.1:8080",
-			ReadHeaderTimeout: Duration{Duration: 5 * time.Second},
-			ReadTimeout:       Duration{Duration: 30 * time.Second},
-			IdleTimeout:       Duration{Duration: 60 * time.Second},
-			ShutdownTimeout:   Duration{Duration: 15 * time.Second},
-		},
-		Schedule: ScheduleConfig{
-			Interval: Duration{Duration: 24 * time.Hour},
-		},
 		Log: LogConfig{
 			Level:  "info",
-			Format: "json",
+			Format: "text",
 		},
 	}
 }
@@ -184,8 +154,8 @@ func normalizeAccounts(cfg *Config) {
 }
 
 func applyEnvironment(cfg *Config) error {
-	if value, ok := os.LookupEnv("PIMBACKUP_LISTEN"); ok {
-		cfg.Server.Listen = value
+	if value, ok := os.LookupEnv("PIMBACKUP_DATA_DIR"); ok {
+		cfg.DataDir = value
 	}
 	if value, ok := os.LookupEnv("PIMBACKUP_LOG_LEVEL"); ok {
 		cfg.Log.Level = value
@@ -193,32 +163,12 @@ func applyEnvironment(cfg *Config) error {
 	if value, ok := os.LookupEnv("PIMBACKUP_LOG_FORMAT"); ok {
 		cfg.Log.Format = value
 	}
-	if err := envBool("PIMBACKUP_SCHEDULE_ENABLED", &cfg.Schedule.Enabled); err != nil {
-		return err
-	}
-	if err := envBool("PIMBACKUP_SCHEDULE_RUN_ON_START", &cfg.Schedule.RunOnStart); err != nil {
-		return err
-	}
-	if value, ok := os.LookupEnv("PIMBACKUP_SCHEDULE_INTERVAL"); ok {
-		parsed, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("PIMBACKUP_SCHEDULE_INTERVAL: %w", err)
-		}
-		cfg.Schedule.Interval.Duration = parsed
-	}
-	if err := envBool("PIMBACKUP_ALLOW_UNAUTHENTICATED", &cfg.Server.AllowUnauthenticated); err != nil {
-		return err
-	}
 	return nil
 }
 
-func envBool(name string, target *bool) error {
-	return configutil.EnvBool(name, target)
-}
-
 func applyOverrides(cfg *Config, overrides Overrides) {
-	if overrides.Listen != nil {
-		cfg.Server.Listen = *overrides.Listen
+	if overrides.DataDir != nil {
+		cfg.DataDir = *overrides.DataDir
 	}
 	if overrides.LogLevel != nil {
 		cfg.Log.Level = *overrides.LogLevel
@@ -229,16 +179,6 @@ func applyOverrides(cfg *Config, overrides Overrides) {
 }
 
 func resolveSecrets(cfg *Config) error {
-	token, tokenSet, err := resolveConfiguredSecret("PIMBACKUP_API_TOKEN", "server.auth_token", cfg.Server.AuthToken, cfg.Server.AuthTokenFile)
-	if err != nil {
-		return err
-	}
-	if tokenSet {
-		cfg.Server.ResolvedAuthToken = token
-		cfg.Server.AuthToken = stringPointer(token)
-		cfg.Server.AuthTokenFile = nil
-	}
-
 	envNames := make(map[string]string)
 	for i := range cfg.Accounts {
 		account := &cfg.Accounts[i]
@@ -343,17 +283,8 @@ func environmentToken(id string) string {
 func (cfg Config) Validate() error {
 	var problems []string
 
-	if cfg.DataDir != "/data" {
-		problems = append(problems, "data_dir is fixed at /data")
-	}
-	if err := validateServer(cfg.Server); err != nil {
-		problems = append(problems, err.Error())
-	}
-	if cfg.Schedule.Enabled && cfg.Schedule.Interval.Duration < time.Minute {
-		problems = append(problems, "schedule.interval must be at least 1m when scheduling is enabled")
-	}
-	if cfg.Schedule.Interval.Duration < 0 {
-		problems = append(problems, "schedule.interval cannot be negative")
+	if !filepath.IsAbs(cfg.DataDir) || filepath.Clean(cfg.DataDir) != cfg.DataDir || cfg.DataDir == string(filepath.Separator) || strings.ContainsAny(cfg.DataDir, "\r\n\x00") {
+		problems = append(problems, "data_dir must be a clean absolute path other than the filesystem root")
 	}
 	switch cfg.Log.Level {
 	case "debug", "info", "warn", "error":
@@ -368,7 +299,6 @@ func (cfg Config) Validate() error {
 
 	seenIDs := make(map[string]struct{})
 	seenEnv := make(map[string]string)
-	enabledAccounts := 0
 	for i, account := range cfg.Accounts {
 		prefix := fmt.Sprintf("accounts[%d]", i)
 		if account.ID != "" {
@@ -376,9 +306,6 @@ func (cfg Config) Validate() error {
 		}
 		if err := validateAccount(account); err != nil {
 			problems = append(problems, prefix+": "+err.Error())
-		}
-		if !account.Disabled {
-			enabledAccounts++
 		}
 		if _, exists := seenIDs[account.ID]; exists {
 			problems = append(problems, prefix+": duplicate account ID")
@@ -390,55 +317,10 @@ func (cfg Config) Validate() error {
 		}
 		seenEnv[envName] = account.ID
 	}
-	if cfg.Schedule.Enabled && enabledAccounts == 0 {
-		problems = append(problems, "schedule.enabled requires at least one enabled account")
-	}
-
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
-}
-
-func validateServer(server ServerConfig) error {
-	var problems []string
-	if server.Listen == "" {
-		problems = append(problems, "server.listen cannot be empty")
-	} else {
-		host, _, err := net.SplitHostPort(server.Listen)
-		if err != nil {
-			problems = append(problems, "server.listen must be a host:port address")
-		} else if !isLoopbackHost(host) && server.ResolvedAuthToken == "" && !server.AllowUnauthenticated {
-			problems = append(problems, "a non-loopback server.listen requires server.auth_token or server.allow_unauthenticated = true")
-		}
-	}
-	if strings.IndexFunc(server.ResolvedAuthToken, unicode.IsSpace) >= 0 {
-		problems = append(problems, "server.auth_token cannot contain whitespace")
-	}
-	if server.ReadHeaderTimeout.Duration <= 0 {
-		problems = append(problems, "server.read_header_timeout must be greater than zero")
-	}
-	if server.ReadTimeout.Duration <= 0 {
-		problems = append(problems, "server.read_timeout must be greater than zero")
-	}
-	if server.IdleTimeout.Duration <= 0 {
-		problems = append(problems, "server.idle_timeout must be greater than zero")
-	}
-	if server.ShutdownTimeout.Duration <= 0 {
-		problems = append(problems, "server.shutdown_timeout must be greater than zero")
-	}
-	return errors.Join(stringsToErrors(problems)...)
-}
-
-func isLoopbackHost(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	if host == "" {
-		return false
-	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	return ip != nil && ip.IsLoopback()
 }
 
 func validateAccount(account AccountConfig) error {
@@ -448,6 +330,12 @@ func validateAccount(account AccountConfig) error {
 	}
 	if account.Timeout.Duration <= 0 {
 		problems = append(problems, "timeout must be greater than zero")
+	}
+	if account.InsecureSkipVerify && !account.AllowInsecure {
+		problems = append(problems, "insecure_skip_verify requires allow_insecure = true")
+	}
+	if account.CAFile != "" && (!filepath.IsAbs(account.CAFile) || filepath.Clean(account.CAFile) != account.CAFile || strings.ContainsAny(account.CAFile, "\r\n\x00")) {
+		problems = append(problems, "ca_file must be a clean absolute path")
 	}
 	if account.Protocol != "imap" {
 		return validateHTTPAccount(account, problems)
@@ -578,14 +466,6 @@ func (cfg Config) Account(id string) (AccountConfig, bool) {
 // RedactedCopy returns effective configuration that is safe to print.
 func (cfg Config) RedactedCopy() Config {
 	copy := cfg
-	copy.Server = cfg.Server
-	if cfg.Server.ResolvedAuthToken != "" {
-		copy.Server.AuthToken = stringPointer(Redacted)
-	} else {
-		copy.Server.AuthToken = nil
-	}
-	copy.Server.AuthTokenFile = nil
-	copy.Server.ResolvedAuthToken = ""
 	copy.Accounts = append([]AccountConfig(nil), cfg.Accounts...)
 	for i := range copy.Accounts {
 		if cfg.Accounts[i].ResolvedPassword != "" {

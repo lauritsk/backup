@@ -29,6 +29,12 @@ func TestDecodeFileRejectsInvalidObjectFields(t *testing.T) {
 	}
 }
 
+func TestDecodeFileRejectsNonRegularPath(t *testing.T) {
+	if err := DecodeFile(t.TempDir(), false, 1<<20, new(any)); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("DecodeFile() = %v", err)
+	}
+}
+
 func TestDurationRoundTrip(t *testing.T) {
 	var duration Duration
 	if err := duration.UnmarshalText([]byte("15m")); err != nil {

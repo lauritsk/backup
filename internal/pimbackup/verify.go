@@ -26,7 +26,7 @@ func (s *Service) verify(ctx context.Context, request model.VerifyRequest) (mode
 	}
 	recorder := issueRecorder{report: &report}
 	if err := s.catalog.QuickCheck(ctx); err != nil {
-		recorder.add(model.VerificationIssue{Path: "pim.db", Error: err.Error()})
+		recorder.add(model.VerificationIssue{Path: "pim.db", Error: s.cleanError(err)})
 	}
 	if request.ObjectID == 0 {
 		if err := s.verifyMessages(ctx, request, &report, recorder); err != nil {
@@ -44,10 +44,10 @@ func (s *Service) verify(ctx context.Context, request model.VerifyRequest) (mode
 			return report, err
 		}
 		for _, scanErr := range scan.Errors {
-			recorder.add(model.VerificationIssue{Error: scanErr.Error()})
+			recorder.add(model.VerificationIssue{Error: s.cleanError(scanErr)})
 		}
 		for _, scanErr := range s.objectStore.Scan(ctx).Errors {
-			recorder.add(model.VerificationIssue{Error: scanErr.Error()})
+			recorder.add(model.VerificationIssue{Error: s.cleanError(scanErr)})
 		}
 	}
 	if report.Failed > 0 {
@@ -84,7 +84,7 @@ func (s *Service) verifyMessages(ctx context.Context, request model.VerifyReques
 			return err
 		}
 		if verifyErr != nil {
-			recorder.add(model.VerificationIssue{MessageID: message.ID, Path: message.Path, Error: verifyErr.Error()})
+			recorder.add(model.VerificationIssue{MessageID: message.ID, Path: message.Path, Error: s.cleanError(verifyErr)})
 		} else {
 			report.Passed++
 		}
@@ -120,7 +120,7 @@ func (s *Service) verifyObjects(ctx context.Context, request model.VerifyRequest
 			return err
 		}
 		if verifyErr != nil {
-			recorder.add(model.VerificationIssue{ObjectID: object.ID, Path: object.Path, Error: verifyErr.Error()})
+			recorder.add(model.VerificationIssue{ObjectID: object.ID, Path: object.Path, Error: s.cleanError(verifyErr)})
 		} else {
 			report.Passed++
 		}

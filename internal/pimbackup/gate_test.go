@@ -28,8 +28,8 @@ func TestServiceDefersReconciliationWhileAnotherOperationRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	if err := second.Ready(context.Background()); err == nil {
-		t.Fatal("second service was ready before startup reconciliation")
+	if second.initialized.Load() {
+		t.Fatal("second service initialized while another process held the lock")
 	}
 	if err := release(); err != nil {
 		t.Fatal(err)
@@ -37,7 +37,7 @@ func TestServiceDefersReconciliationWhileAnotherOperationRuns(t *testing.T) {
 	if _, err := second.Verify(context.Background(), model.VerifyRequest{}); err != nil {
 		t.Fatalf("Verify() after operation lock release = %v", err)
 	}
-	if err := second.Ready(context.Background()); err != nil {
-		t.Fatalf("Ready() after deferred reconciliation = %v", err)
+	if !second.initialized.Load() {
+		t.Fatal("second service did not initialize after lock release")
 	}
 }

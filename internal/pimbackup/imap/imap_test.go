@@ -38,6 +38,7 @@ func TestNetworkDialerTLSModes(t *testing.T) {
 				Port:               port,
 				TLS:                mode,
 				InsecureSkipVerify: true,
+				AllowInsecure:      true,
 				Username:           "user",
 				ResolvedPassword:   "password",
 				Timeout:            config.Duration{Duration: 5 * time.Second},
@@ -84,7 +85,7 @@ func TestNetworkDialerAuthenticationTimeout(t *testing.T) {
 	}
 	started := time.Now()
 	_, err = (NetworkDialer{}).Dial(context.Background(), config.AccountConfig{
-		ID: "timeout", Host: host, Port: port, TLS: "plain", Username: "user", ResolvedPassword: "password",
+		ID: "timeout", Host: host, Port: port, TLS: "plain", AllowInsecure: true, Username: "user", ResolvedPassword: "password",
 		Timeout: config.Duration{Duration: 100 * time.Millisecond},
 	})
 	if err == nil {

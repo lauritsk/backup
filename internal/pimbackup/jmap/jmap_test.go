@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,9 +39,44 @@ func TestSessionDiscoveryHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_, err := New(ctx, config.AccountConfig{Protocol: "jmap", URL: server.URL, Auth: "bearer", ResolvedToken: "token", Timeout: config.Duration{Duration: 5 * time.Second}})
+	_, err := New(ctx, config.AccountConfig{Protocol: "jmap", AllowInsecure: true, URL: server.URL, Auth: "bearer", ResolvedToken: "token", Timeout: config.Duration{Duration: 5 * time.Second}})
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > 500*time.Millisecond {
 		t.Fatalf("New() = %v after %v", err, time.Since(started))
+	}
+}
+
+func TestAuthenticatedRedirectCannotLeaveApprovedOrigins(t *testing.T) {
+	var reached atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) }))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer secret" {
+			t.Errorf("source Authorization = %q", request.Header.Get("Authorization"))
+		}
+		http.Redirect(writer, request, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+	transport, err := newAuthTransport(http.DefaultTransport, config.AccountConfig{Auth: "bearer", ResolvedToken: "secret"}, source.URL, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: transport}
+	_, err = client.Get(source.URL)
+	if err == nil || !strings.Contains(err.Error(), "unapproved origin") {
+		t.Fatalf("Get() = %v", err)
+	}
+	if reached.Load() {
+		t.Fatal("redirect target received authenticated request")
+	}
+}
+
+func TestAuthenticatedSessionCannotAdvertiseHTTPService(t *testing.T) {
+	transport, err := newAuthTransport(http.DefaultTransport, config.AccountConfig{Auth: "bearer", ResolvedToken: "secret"}, "https://mail.example/session", context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.allowURLs("http://mail.example/api"); err == nil || !strings.Contains(err.Error(), "HTTPS downgrade") {
+		t.Fatalf("allowURLs() = %v", err)
 	}
 }
 
@@ -106,7 +142,7 @@ func TestMailBackupAndImport(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := New(context.Background(), config.AccountConfig{Protocol: "jmap", URL: server.URL + "/session", Auth: "bearer", ResolvedToken: "token", Timeout: config.Duration{Duration: time.Second}})
+	client, err := New(context.Background(), config.AccountConfig{Protocol: "jmap", AllowInsecure: true, URL: server.URL + "/session", Auth: "bearer", ResolvedToken: "token", Timeout: config.Duration{Duration: time.Second}})
 	if err != nil {
 		t.Fatal(err)
 	}
