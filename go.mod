@@ -9,7 +9,7 @@ require (
 	github.com/emersion/go-vcard v0.1.0
 	github.com/emersion/go-webdav v0.7.0
 	github.com/gofrs/flock v0.13.1
-	modernc.org/sqlite v1.58.0
+	modernc.org/sqlite v1.59.0
 )
 
 require (
